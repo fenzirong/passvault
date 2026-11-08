@@ -59,9 +59,24 @@ jobs:
         with:
           distribution: temurin
           java-version: '17'
-      - uses: android-actions/setup-android@v3
-      - name: 安装 Android SDK 34
-        run: sdkmanager "platforms;android-34" "build-tools;34.0.0"
+      - name: 准备 Android SDK
+        run: |
+          set -e
+          SDK="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}}"
+          echo "ANDROID_HOME=$SDK" >> "$GITHUB_ENV"
+          echo "ANDROID_SDK_ROOT=$SDK" >> "$GITHUB_ENV"
+          echo "SDK 目录：$SDK"
+          ls "$SDK" || true
+          SDKMGR="$SDK/cmdline-tools/latest/bin/sdkmanager"
+          if [ ! -x "$SDKMGR" ]; then
+            SDKMGR="$(command -v sdkmanager || true)"
+          fi
+          echo "sdkmanager：$SDKMGR"
+          if [ -n "$SDKMGR" ] && [ -x "$SDKMGR" ]; then
+            yes | "$SDKMGR" --licenses > /dev/null 2>&1 || true
+            "$SDKMGR" "platform-tools" "platforms;android-34" "build-tools;34.0.0" || true
+          fi
+          echo "sdk.dir=$SDK" > android/local.properties
       - run: npm install --no-audit --no-fund
         env:
           ELECTRON_SKIP_BINARY_DOWNLOAD: '1'
