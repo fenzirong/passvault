@@ -225,6 +225,21 @@ CI 里做了什么：
 | `android` | ubuntu + JDK 17 + Android SDK 34 + Gradle → `app-debug.apk` |
 | `release` | 打 tag 时自动发布 Release |
 
+### 发布签名（release APK）
+
+默认 CI 产出的是 debug 签名 APK。要出正式签名版，在仓库 **Settings → Secrets and variables → Actions** 添加 4 个 secret：
+
+| Secret | 值 |
+| --- | --- |
+| `ANDROID_KEYSTORE_BASE64` | keystore 文件的 base64（`base64 -w0 release.keystore`） |
+| `ANDROID_KEYSTORE_PASSWORD` | keystore 密码 |
+| `ANDROID_KEY_ALIAS` | 密钥别名（如 `passvault`） |
+| `ANDROID_KEY_PASSWORD` | 密钥密码 |
+
+配置后 CI 会自动改跑 `assembleRelease`，产物为 `PassVault-<版本>-release.apk`；没配置则退回 debug 版。
+
+> ⚠️ keystore 一旦丢失就无法再发布可覆盖安装的更新，请务必备份。仓库已通过 `.gitignore` 排除 `*.keystore`。
+
 ### 结构说明
 
 ```

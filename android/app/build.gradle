@@ -1,5 +1,8 @@
 apply plugin: 'com.android.application'
 
+// 发布签名：CI 中通过环境变量注入（未提供时退回 debug 签名）
+def releaseKeystore = System.getenv("KEYSTORE_FILE")
+
 android {
     namespace "com.passvault.app"
     compileSdk rootProject.ext.compileSdkVersion
@@ -7,8 +10,8 @@ android {
         applicationId "com.passvault.app"
         minSdkVersion rootProject.ext.minSdkVersion
         targetSdkVersion rootProject.ext.targetSdkVersion
-        versionCode 2
-        versionName "1.1.0"
+        versionCode 3
+        versionName "1.1.1"
         testInstrumentationRunner "androidx.test.runner.AndroidJUnitRunner"
         aaptOptions {
              // Files and dirs to omit from the packaged assets dir, modified to accommodate modern web apps.
@@ -16,10 +19,23 @@ android {
             ignoreAssetsPattern '!.svn:!.git:!.ds_store:!*.scc:.*:!CVS:!thumbs.db:!picasa.ini:!*~'
         }
     }
+    signingConfigs {
+        release {
+            if (releaseKeystore) {
+                storeFile file(releaseKeystore)
+                storePassword System.getenv("KEYSTORE_PASSWORD")
+                keyAlias System.getenv("KEY_ALIAS")
+                keyPassword System.getenv("KEY_PASSWORD")
+            }
+        }
+    }
     buildTypes {
         release {
             minifyEnabled false
             proguardFiles getDefaultProguardFile('proguard-android.txt'), 'proguard-rules.pro'
+            if (releaseKeystore) {
+                signingConfig signingConfigs.release
+            }
         }
     }
 }

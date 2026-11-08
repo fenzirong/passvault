@@ -82,15 +82,31 @@ jobs:
           ELECTRON_SKIP_BINARY_DOWNLOAD: '1'
       - name: 同步 Web 资源到安卓工程
         run: npx cap sync android
-      - name: 构建 debug APK
+      - name: 构建 APK（配置了签名密钥则输出 release 版）
+        env:
+          KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
         run: |
           chmod +x android/gradlew
+          mkdir -p dist-apk
           cd android
-          ./gradlew assembleDebug --no-daemon --stacktrace
+          if [ -n "$KEYSTORE_BASE64" ]; then
+            echo "$KEYSTORE_BASE64" | base64 -d > release.keystore
+            export KEYSTORE_FILE="$PWD/release.keystore"
+            ./gradlew assembleRelease --no-daemon --stacktrace
+            cp app/build/outputs/apk/release/app-release.apk ../dist-apk/PassVault-1.1.1-release.apk
+            echo "✅ 已生成签名 release APK"
+          else
+            ./gradlew assembleDebug --no-daemon --stacktrace
+            cp app/build/outputs/apk/debug/app-debug.apk ../dist-apk/PassVault-1.1.1-debug.apk
+            echo "⚠️ 未配置签名密钥，退回 debug APK"
+          fi
       - uses: actions/upload-artifact@v4
         with:
           name: PassVault-Android
-          path: android/app/build/outputs/apk/debug/*.apk
+          path: dist-apk/*.apk
           if-no-files-found: error
           retention-days: 30
 
