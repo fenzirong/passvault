@@ -227,18 +227,16 @@ CI 里做了什么：
 
 ### 发布签名（release APK）
 
-默认 CI 产出的是 debug 签名 APK。要出正式签名版，在仓库 **Settings → Secrets and variables → Actions** 添加 4 个 secret：
+仓库内置了自签名密钥，CI 会自动产出**正式签名**的 `PassVault-<版本>-release.apk`：
 
-| Secret | 值 |
+| 文件 | 说明 |
 | --- | --- |
-| `ANDROID_KEYSTORE_BASE64` | keystore 文件的 base64（`base64 -w0 release.keystore`） |
-| `ANDROID_KEYSTORE_PASSWORD` | keystore 密码 |
-| `ANDROID_KEY_ALIAS` | 密钥别名（如 `passvault`） |
-| `ANDROID_KEY_PASSWORD` | 密钥密码 |
+| `android/release.keystore` | 签名密钥（RSA 2048，有效期 10000 天） |
+| `android/keystore.properties` | 别名与密码 |
 
-配置后 CI 会自动改跑 `assembleRelease`，产物为 `PassVault-<版本>-release.apk`；没配置则退回 debug 版。
-
-> ⚠️ keystore 一旦丢失就无法再发布可覆盖安装的更新，请务必备份。仓库已通过 `.gitignore` 排除 `*.keystore`。
+> ⚠️ **安全提示**：这两个文件是公开的，意味着任何人都能用同一把密钥签出「可覆盖安装」的 APK。个人自用没问题；如果要公开分发或上架，请删除这两个文件，改用 GitHub Secrets 注入（`KEYSTORE_FILE` / `KEYSTORE_PASSWORD` / `KEY_ALIAS` / `KEY_PASSWORD` 四个环境变量，`build.gradle` 已支持）。
+>
+> ⚠️ **务必备份** `android/release.keystore`：丢失后无法再发布能覆盖安装的更新。
 
 ### 结构说明
 

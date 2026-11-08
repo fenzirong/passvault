@@ -9,6 +9,3 @@ android/build/
 android/local.properties
 android/.idea/
 www/
-android/release.keystore
-*.keystore
-*.jks
