@@ -1,0 +1,86 @@
+{
+  "name": "dsh-passvault",
+  "productName": "PassVault",
+  "version": "1.1.0",
+  "private": true,
+  "type": "module",
+  "description": "本地加密的密码保险库：Windows 桌面版 / 安卓 App，支持 2FA、扫码、密码生成与局域网同步",
+  "author": "PassVault",
+  "license": "MIT",
+  "main": "desktop/main.mjs",
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "start": "node server/server.js",
+    "test": "node --test tests/*.test.mjs",
+    "desktop": "electron .",
+    "dist:win": "electron-builder --win --publish never",
+    "dist:linux": "electron-builder --linux --publish never",
+    "pack:win": "electron-packager . PassVault --platform=win32 --arch=x64 --out=dist --overwrite --icon=build/icon.ico",
+    "android:sync": "cap sync android",
+    "android:build": "cd android && ./gradlew assembleDebug"
+  },
+  "devDependencies": {
+    "@capacitor/android": "^6.2.0",
+    "@capacitor/cli": "^6.2.0",
+    "@capacitor/core": "^6.2.0",
+    "@electron/packager": "^18.3.6",
+    "electron": "^33.2.3",
+    "electron-builder": "^25.1.8"
+  },
+  "build": {
+    "appId": "com.passvault.desktop",
+    "productName": "PassVault",
+    "directories": {
+      "output": "dist",
+      "buildResources": "build"
+    },
+    "files": [
+      "desktop/**/*",
+      "server/**/*",
+      "web/**/*",
+      "package.json"
+    ],
+    "asar": true,
+    "win": {
+      "icon": "build/icon.ico",
+      "target": [
+        {
+          "target": "nsis",
+          "arch": [
+            "x64"
+          ]
+        },
+        {
+          "target": "portable",
+          "arch": [
+            "x64"
+          ]
+        }
+      ]
+    },
+    "nsis": {
+      "oneClick": false,
+      "perMachine": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "shortcutName": "密码保险库",
+      "artifactName": "PassVault-Setup-${version}.exe"
+    },
+    "portable": {
+      "artifactName": "PassVault-Portable-${version}.exe"
+    },
+    "linux": {
+      "icon": "build/icon.png",
+      "category": "Utility",
+      "target": [
+        "AppImage"
+      ]
+    }
+  },
+  "dependencies": {
+    "@capacitor/filesystem": "^6.0.4",
+    "@capacitor/share": "^6.0.4"
+  }
+}

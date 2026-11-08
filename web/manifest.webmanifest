@@ -1,0 +1,33 @@
+{
+  "name": "密码保险库",
+  "short_name": "保险库",
+  "description": "本地加密的密码管理器，支持 2FA 动态验证码、密码生成与局域网同步",
+  "lang": "zh-CN",
+  "start_url": "./",
+  "scope": "./",
+  "display": "standalone",
+  "orientation": "any",
+  "background_color": "#0d0f14",
+  "theme_color": "#0d0f14",
+  "categories": ["productivity", "utilities", "security"],
+  "icons": [
+    {
+      "src": "icons/icon-192.png",
+      "sizes": "192x192",
+      "type": "image/png",
+      "purpose": "any"
+    },
+    {
+      "src": "icons/icon-512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any"
+    },
+    {
+      "src": "icons/icon-512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "maskable"
+    }
+  ]
+}

@@ -1,0 +1,7 @@
+<?xml version='1.0' encoding='utf-8'?>
+<resources>
+    <string name="app_name">密码保险库</string>
+    <string name="title_activity_main">密码保险库</string>
+    <string name="package_name">com.passvault.app</string>
+    <string name="custom_url_scheme">com.passvault.app</string>
+</resources>
