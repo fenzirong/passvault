@@ -59,6 +59,8 @@
 | `PassVault-Portable-1.1.0.exe` | Windows 免安装版，双击即用 |
 | `app-debug.apk` | 安卓安装包（允许「安装未知来源应用」后安装） |
 
+> 仓库里的 `dist/` 目录已附带本机构建产物：`PassVault-Windows-Portable-1.1.0.zip`（解压后双击 `PassVault.exe`）与 `PassVault-1.1.0-debug.apk`。安装包（Setup.exe）由 CI 在 Windows 上生成。
+
 安装完成后：Windows 双击图标即可；安卓打开 App 后先在「设置 → 局域网同步」填电脑的地址与口令。
 
 ### 方式 B：源码运行（Windows）
