@@ -82,18 +82,33 @@ jobs:
           ELECTRON_SKIP_BINARY_DOWNLOAD: '1'
       - name: 同步 Web 资源到安卓工程
         run: npx cap sync android
+      - name: 写入签名密钥（来自 Secrets）
+        env:
+          KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+        run: |
+          if [ -n "$KEYSTORE_BASE64" ]; then
+            echo "$KEYSTORE_BASE64" | base64 -d > android/release.keystore
+            echo "✅ 已从 Secrets 写入签名密钥"
+          else
+            echo "⚠️ 未配置 ANDROID_KEYSTORE_BASE64，将构建 debug 版"
+          fi
       - name: 构建 APK（有签名密钥则输出 release 版）
+        env:
+          KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
         run: |
           chmod +x android/gradlew
           mkdir -p dist-apk
           cd android
           if [ -f release.keystore ]; then
+            export KEYSTORE_FILE="$PWD/release.keystore"
             ./gradlew assembleRelease --no-daemon --stacktrace
-            cp app/build/outputs/apk/release/app-release.apk ../dist-apk/PassVault-1.1.1-release.apk
+            cp app/build/outputs/apk/release/app-release.apk ../dist-apk/PassVault-1.1.2-release.apk
             echo "✅ 已生成签名 release APK"
           else
             ./gradlew assembleDebug --no-daemon --stacktrace
-            cp app/build/outputs/apk/debug/app-debug.apk ../dist-apk/PassVault-1.1.1-debug.apk
+            cp app/build/outputs/apk/debug/app-debug.apk ../dist-apk/PassVault-1.1.2-debug.apk
             echo "⚠️ 未找到签名密钥，退回 debug APK"
           fi
       - uses: actions/upload-artifact@v4

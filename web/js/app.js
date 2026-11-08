@@ -1257,7 +1257,7 @@ function openSettings(tab = 'general') {
 
     <div class="section-title">关于</div>
     <p class="hint" style="margin:0">
-      密码保险库 v1.1.1 · 本地加密，零依赖。<br>
+      密码保险库 v1.1.2 · 本地加密，零依赖。<br>
       加密：PBKDF2-SHA256（${KDF_ITERATIONS.toLocaleString()} 次）+ AES-256-GCM；2FA：RFC 6238 TOTP。<br>
       参考开源项目：KeePassXC、KeePassDX、Bitwarden、Aegis Authenticator；二维码解码使用 jsQR（Apache-2.0）。
     </p>
