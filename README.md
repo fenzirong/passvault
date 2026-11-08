@@ -14,6 +14,10 @@
 | --- | --- |
 | ![生成器](docs/screenshot-generator.png) | ![冲突](docs/screenshot-sync.png) |
 
+| 自动加密备份 | 扫码导入 2FA |
+| --- | --- |
+| ![备份](docs/screenshot-backup.png) | ![扫码](docs/screenshot-scan.png) |
+
 ---
 
 

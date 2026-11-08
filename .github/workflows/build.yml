@@ -60,7 +60,11 @@ jobs:
           distribution: temurin
           java-version: '17'
       - uses: android-actions/setup-android@v3
+      - name: 安装 Android SDK 34
+        run: sdkmanager "platforms;android-34" "build-tools;34.0.0"
       - run: npm install --no-audit --no-fund
+        env:
+          ELECTRON_SKIP_BINARY_DOWNLOAD: '1'
       - name: 同步 Web 资源到安卓工程
         run: npx cap sync android
       - name: 构建 debug APK
