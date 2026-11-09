@@ -92,7 +92,7 @@ function showPhoneHelp() {
     '',
     '首次访问会提示证书不受信任，选择「高级 → 继续前往」。',
     '',
-    `同步口令：${server?.token || '（未设置）'}`,
+    `配对码：${server?.pairingCode || '（未设置）'}`,
     '',
     `数据目录：${server?.info.dataDir || ''}`,
   ].join('\n');
@@ -101,11 +101,11 @@ function showPhoneHelp() {
     title: '手机访问地址',
     message: '在手机上打开密码保险库',
     detail,
-    buttons: ['知道了', '复制口令'],
+    buttons: ['知道了', '复制配对码'],
     defaultId: 0,
     cancelId: 0,
   }).then(({ response }) => {
-    if (response === 1 && server?.token) clipboard.writeText(server.token);
+    if (response === 1 && server?.pairingCode) clipboard.writeText(server.pairingCode);
   });
 }
 

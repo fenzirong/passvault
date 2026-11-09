@@ -11,6 +11,9 @@ import os from 'node:os';
 import crypto from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { ensureCert } from './cert.js';
+import { Discovery, lanAddresses } from './discovery.js';
+
+export { lanAddresses };
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 export const DEFAULT_WEB_DIR = path.resolve(__dirname, '..', 'web');
@@ -31,17 +34,16 @@ const MIME = {
 
 const MAX_BODY = 32 * 1024 * 1024;
 
-function lanAddresses() {
-  const out = [];
-  for (const [name, list] of Object.entries(os.networkInterfaces())) {
-    for (const item of list || []) {
-      if (item.family === 'IPv4' && !item.internal) out.push({ name, address: item.address });
-    }
-  }
-  return out;
+function isPrivateHost(host) {
+  if (!/^\d{1,3}(\.\d{1,3}){3}$/.test(host)) return false;
+  const [a, b] = host.split('.').map(Number);
+  if (a === 10) return true;
+  if (a === 127) return true;
+  if (a === 192 && b === 168) return true;
+  if (a === 172 && b >= 16 && b <= 31) return true;
+  if (a === 169 && b === 254) return true;
+  return false;
 }
-
-export { lanAddresses };
 
 export class PassVaultServer {
   constructor(options = {}) {
@@ -65,6 +67,9 @@ export class PassVaultServer {
     this.backupDir = path.join(this.dataDir, 'backups');
     this.state = { revision: 0, updatedAt: null, envelope: null };
     this.token = '';
+    this.pairingCode = '';
+    this.deviceId = '';
+    this.discovery = null;
     this.servers = [];
     this.httpPort = 0;
     this.httpsPort = 0;
@@ -103,6 +108,46 @@ export class PassVaultServer {
     return token;
   }
 
+  /** 6 位配对码：保存在 data/pairing.txt，可在界面上重新生成 */
+  loadPairing() {
+    const file = path.join(this.dataDir, 'pairing.txt');
+    try {
+      const saved = fs.readFileSync(file, 'utf8').trim();
+      if (/^\d{6}$/.test(saved)) return saved;
+    } catch {
+      /* 首次运行 */
+    }
+    return this.regeneratePairing();
+  }
+
+  regeneratePairing() {
+    const code = String(crypto.randomInt(0, 1_000_000)).padStart(6, '0');
+    try {
+      fs.writeFileSync(path.join(this.dataDir, 'pairing.txt'), code + '\n', { mode: 0o600 });
+    } catch {
+      /* 忽略写入失败 */
+    }
+    this.pairingCode = code;
+    return code;
+  }
+
+  loadDeviceId() {
+    const file = path.join(this.dataDir, 'device.txt');
+    try {
+      const saved = fs.readFileSync(file, 'utf8').trim();
+      if (saved) return saved;
+    } catch {
+      /* 首次运行 */
+    }
+    const id = crypto.randomUUID();
+    try {
+      fs.writeFileSync(file, id + '\n', { mode: 0o600 });
+    } catch {
+      /* 忽略 */
+    }
+    return id;
+  }
+
   loadState() {
     try {
       const raw = fs.readFileSync(this.vaultFile, 'utf8');
@@ -126,7 +171,7 @@ export class PassVaultServer {
       'Content-Length': Buffer.byteLength(body),
       'Cache-Control': 'no-store',
       'Access-Control-Allow-Origin': '*',
-      'Access-Control-Allow-Headers': 'Content-Type, X-Sync-Token, If-Match',
+      'Access-Control-Allow-Headers': 'Content-Type, X-Sync-Token, X-Pair-Code, If-Match',
       'Access-Control-Allow-Methods': 'GET, PUT, OPTIONS',
       'Access-Control-Expose-Headers': 'ETag',
     });
@@ -152,19 +197,24 @@ export class PassVaultServer {
   }
 
   checkAuth(req) {
-    if (!this.token) return true;
-    const provided = req.headers['x-sync-token'] || '';
-    const a = Buffer.from(String(provided));
-    const b = Buffer.from(String(this.token));
-    const ok = a.length === b.length && crypto.timingSafeEqual(a, b);
-    if (!ok) {
-      const ip = req.socket.remoteAddress || 'unknown';
-      const rec = this.authFailures.get(ip) || { count: 0, until: 0 };
-      rec.count++;
-      if (rec.count >= 5) rec.until = Date.now() + 30_000;
-      this.authFailures.set(ip, rec);
-    }
-    return ok;
+    const code = String(req.headers['x-pair-code'] || '');
+    const token = String(req.headers['x-sync-token'] || '');
+    const match = (value, expected) => {
+      if (!expected) return false;
+      const a = Buffer.from(String(value));
+      const b = Buffer.from(String(expected));
+      return a.length === b.length && crypto.timingSafeEqual(a, b);
+    };
+    const ok = match(code, this.pairingCode) || match(token, this.token) || match(token, this.pairingCode);
+    if (ok) return true;
+    if (!this.pairingCode && !this.token) return true;
+
+    const ip = req.socket.remoteAddress || 'unknown';
+    const rec = this.authFailures.get(ip) || { count: 0, until: 0 };
+    rec.count++;
+    if (rec.count >= 5) rec.until = Date.now() + 30_000;
+    this.authFailures.set(ip, rec);
+    return false;
   }
 
   isLockedOut(req) {
@@ -250,7 +300,7 @@ export class PassVaultServer {
     if (req.method === 'OPTIONS') {
       res.writeHead(204, {
         'Access-Control-Allow-Origin': '*',
-        'Access-Control-Allow-Headers': 'Content-Type, X-Sync-Token, If-Match',
+        'Access-Control-Allow-Headers': 'Content-Type, X-Sync-Token, X-Pair-Code, If-Match',
         'Access-Control-Allow-Methods': 'GET, PUT, OPTIONS',
         'Access-Control-Max-Age': '86400',
       });
@@ -268,6 +318,7 @@ export class PassVaultServer {
         app: 'dsh-passvault',
         version: 2,
         name: os.hostname(),
+        deviceId: this.deviceId,
         revision: this.state.revision,
         updatedAt: this.state.updatedAt,
         hasVault: Boolean(this.state.envelope),
@@ -276,8 +327,62 @@ export class PassVaultServer {
       return;
     }
 
+    // 局域网设备发现（公开：只暴露设备名与地址，和 UDP 广播内容一致）
+    if (pathname === '/api/discovery' && req.method === 'GET') {
+      this.sendJson(res, 200, {
+        self: this.discovery
+          ? this.discovery.self()
+          : {
+              id: this.deviceId,
+              name: os.hostname(),
+              httpPort: this.httpPort,
+              httpsPort: this.httpsPort,
+              addresses: lanAddresses(),
+            },
+        peers: this.discovery ? this.discovery.list() : [],
+      });
+      return;
+    }
+
+    // 配对码只允许本机查看（Electron 窗口 / 本机浏览器）
+    if (pathname === '/api/pairing' && req.method === 'GET') {
+      const ip = req.socket.remoteAddress || '';
+      const isLocal = ip === '127.0.0.1' || ip === '::1' || ip === '::ffff:127.0.0.1';
+      if (!isLocal) {
+        this.sendJson(res, 403, { error: '配对码只能在本机查看' });
+        return;
+      }
+      this.sendJson(res, 200, {
+        code: this.pairingCode,
+        name: os.hostname(),
+        deviceId: this.deviceId,
+        httpPort: this.httpPort,
+        httpsPort: this.httpsPort,
+        addresses: lanAddresses(),
+      });
+      return;
+    }
+
     if (!this.checkAuth(req)) {
-      this.sendJson(res, 401, { error: '同步口令不正确' });
+      this.sendJson(res, 401, { error: '配对码不正确' });
+      return;
+    }
+
+    // 重新生成配对码（仅本机）
+    if (pathname === '/api/pairing/rotate' && req.method === 'POST') {
+      const ip = req.socket.remoteAddress || '';
+      const isLocal = ip === '127.0.0.1' || ip === '::1' || ip === '::ffff:127.0.0.1';
+      if (!isLocal) {
+        this.sendJson(res, 403, { error: '仅本机可操作' });
+        return;
+      }
+      this.sendJson(res, 200, { code: this.regeneratePairing() });
+      return;
+    }
+
+    // 跨设备中继：手机端只能访问「提供页面的那台设备」，由它转发到其他设备
+    if (pathname === '/api/relay' && req.method === 'POST') {
+      await this.handleRelay(req, res);
       return;
     }
 
@@ -342,11 +447,57 @@ export class PassVaultServer {
     this.sendJson(res, 404, { error: '接口不存在' });
   }
 
+  /* ------------------------------ 中继 ------------------------------ */
+
+  async handleRelay(req, res) {
+    let payload;
+    try {
+      payload = JSON.parse(await this.readBody(req));
+    } catch {
+      this.sendJson(res, 400, { error: '请求体不是合法 JSON' });
+      return;
+    }
+    const { target, method = 'GET', path: targetPath = '/api/info', headers = {}, body } = payload || {};
+    let url;
+    try {
+      url = new URL(String(target));
+    } catch {
+      this.sendJson(res, 400, { error: '目标地址无效' });
+      return;
+    }
+    if (!['http:', 'https:'].includes(url.protocol) || !isPrivateHost(url.hostname)) {
+      this.sendJson(res, 400, { error: '只允许中继到局域网地址' });
+      return;
+    }
+    if (!String(targetPath).startsWith('/api/') || String(targetPath).includes('..')) {
+      this.sendJson(res, 400, { error: '只允许中继 /api/ 接口' });
+      return;
+    }
+    if (!['GET', 'PUT', 'POST'].includes(String(method).toUpperCase())) {
+      this.sendJson(res, 400, { error: '不支持的请求方法' });
+      return;
+    }
+    try {
+      const upstream = await fetch(`${url.origin}${targetPath}`, {
+        method: String(method).toUpperCase(),
+        headers: { 'Content-Type': 'application/json', ...headers },
+        body: body === undefined ? undefined : typeof body === 'string' ? body : JSON.stringify(body),
+        signal: AbortSignal.timeout(10_000),
+      });
+      const text = await upstream.text();
+      this.sendJson(res, 200, { status: upstream.status, body: text });
+    } catch (err) {
+      this.sendJson(res, 502, { error: `无法连接目标设备：${err.message}` });
+    }
+  }
+
   /* ------------------------------ 启动 / 停止 ------------------------------ */
 
   async start() {
     this.initFs();
     this.token = this.loadToken();
+    this.deviceId = this.loadDeviceId();
+    this.pairingCode = this.loadPairing();
     this.loadState();
 
     const listen = (server, port) =>
@@ -399,10 +550,26 @@ export class PassVaultServer {
       }
     }
 
-    return { httpPort: this.httpPort, httpsPort: this.httpsPort, token: this.token };
+    this.discovery = new Discovery({
+      deviceId: this.deviceId,
+      name: os.hostname(),
+      httpPort: this.httpPort,
+      httpsPort: this.httpsPort,
+    });
+    this.discovery.start();
+
+    return {
+      httpPort: this.httpPort,
+      httpsPort: this.httpsPort,
+      token: this.token,
+      pairingCode: this.pairingCode,
+      deviceId: this.deviceId,
+    };
   }
 
   async close() {
+    this.discovery?.stop();
+    this.discovery = null;
     await Promise.all(
       this.servers.map((s) => new Promise((resolve) => s.close(() => resolve()))),
     );
@@ -414,6 +581,8 @@ export class PassVaultServer {
       httpPort: this.httpPort,
       httpsPort: this.httpsPort,
       token: this.token,
+      pairingCode: this.pairingCode,
+      deviceId: this.deviceId,
       revision: this.state.revision,
       dataDir: this.dataDir,
     };

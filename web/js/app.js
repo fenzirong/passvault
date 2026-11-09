@@ -49,7 +49,14 @@ import {
   parseJsonImport,
   purgeTombstones,
 } from './vault.js';
-import { SyncClient, SyncError } from './sync.js';
+import {
+  SyncClient,
+  SyncError,
+  sameOrigin,
+  fetchDiscovery,
+  fetchPairingInfo,
+  rotatePairingCode,
+} from './sync.js';
 import { openQrScanner } from './qrscan.js';
 import {
   listSnapshots,
@@ -101,7 +108,7 @@ const state = {
   query: '',
   selectedId: null,
   revealed: new Set(),
-  sync: { url: '', token: '', lastSyncAt: null },
+  sync: { devices: [], activeId: null, lastSyncAt: null },
   ui: { theme: 'dark' },
   deviceId: '',
   saveTimer: null,
@@ -164,11 +171,22 @@ function loadPrefs() {
   }
   try {
     const sync = JSON.parse(localStorage.getItem(LS.sync) || '{}');
-    state.sync = {
-      url: sync.url || '',
-      token: sync.token || '',
-      lastSyncAt: sync.lastSyncAt || null,
-    };
+    if (Array.isArray(sync.devices)) {
+      state.sync = {
+        devices: sync.devices.filter((d) => d && d.url),
+        activeId: sync.activeId || sync.devices[0]?.id || null,
+        lastSyncAt: sync.lastSyncAt || null,
+      };
+    } else if (sync.url) {
+      // 兼容旧版「地址 + 口令」配置
+      const device = {
+        id: uuid(),
+        name: hostOf(sync.url) || '已配对设备',
+        url: sync.url,
+        code: sync.token || '',
+      };
+      state.sync = { devices: [device], activeId: device.id, lastSyncAt: sync.lastSyncAt || null };
+    }
   } catch {
     /* 忽略 */
   }
@@ -1203,25 +1221,9 @@ function openSettings(tab = 'general') {
     <div class="section-title">局域网同步</div>
     <div class="sync-status" id="sync-status">
       <span class="dot"></span>
-      <span id="sync-status-text">${
-        state.sync.url
-          ? `已配置：${escapeHtml(state.sync.url)}${state.sync.lastSyncAt ? ` · 上次同步 ${relativeTime(state.sync.lastSyncAt)}` : ''}`
-          : '尚未配置同步服务器'
-      }</span>
+      <span id="sync-status-text">${syncSummary()}</span>
     </div>
-    <label class="field"><span class="field-label">服务器地址</span>
-      <input id="set-sync-url" type="text" value="${escapeHtml(state.sync.url)}" placeholder="https://192.168.1.10:8443" spellcheck="false">
-    </label>
-    <label class="field"><span class="field-label">同步口令</span>
-      <input id="set-sync-token" type="text" value="${escapeHtml(state.sync.token)}" placeholder="XXXX-XXXX-XXXX-XXXX" spellcheck="false" style="font-family:var(--mono)">
-    </label>
-    <p class="hint">在电脑上运行 <code>scripts/start-windows.bat</code>（或 <code>node server/server.js</code>），
-      控制台会显示局域网地址与同步口令。手机请用 <b>https://IP:8443</b> 访问（证书警告点「继续前往」），
-      并与电脑连接同一个 Wi-Fi。</p>
-    <div style="display:flex;gap:10px;margin-top:12px">
-      <button class="btn sm ghost" id="set-sync-test">测试连接</button>
-      <button class="btn sm primary" id="set-sync-now">立即同步</button>
-    </div>
+    <button class="btn sm ghost" id="set-sync-open">打开同步面板</button>
 
     <div class="section-title">数据与备份</div>
     <div class="setting-row">
@@ -1257,7 +1259,7 @@ function openSettings(tab = 'general') {
 
     <div class="section-title">关于</div>
     <p class="hint" style="margin:0">
-      密码保险库 v1.1.2 · 本地加密，零依赖。<br>
+      密码保险库 v1.2.0 · 本地加密，零依赖。<br>
       加密：PBKDF2-SHA256（${KDF_ITERATIONS.toLocaleString()} 次）+ AES-256-GCM；2FA：RFC 6238 TOTP。<br>
       参考开源项目：KeePassXC、KeePassDX、Bitwarden、Aegis Authenticator；二维码解码使用 jsQR（Apache-2.0）。
     </p>
@@ -1285,37 +1287,9 @@ function openSettings(tab = 'general') {
         close();
         openSettings();
       };
-      root.querySelector('#set-sync-url').onchange = (ev) => {
-        state.sync.url = ev.target.value.trim();
-        savePrefs();
-      };
-      root.querySelector('#set-sync-token').onchange = (ev) => {
-        state.sync.token = ev.target.value.trim();
-        savePrefs();
-      };
-      root.querySelector('#set-sync-test').onclick = async (ev) => {
-        const btn = ev.currentTarget;
-        state.sync.url = root.querySelector('#set-sync-url').value.trim();
-        state.sync.token = root.querySelector('#set-sync-token').value.trim();
-        savePrefs();
-        btn.disabled = true;
-        btn.textContent = '连接中…';
-        try {
-          const info = await new SyncClient({ baseUrl: state.sync.url, token: state.sync.token }).info();
-          setSyncStatus(root, 'ok', `连接成功 · 服务器 ${info.name} · 版本 ${info.revision}${info.hasVault ? '' : '（空）'}`);
-        } catch (err) {
-          setSyncStatus(root, 'err', err.message);
-        } finally {
-          btn.disabled = false;
-          btn.textContent = '测试连接';
-        }
-      };
-      root.querySelector('#set-sync-now').onclick = () => {
-        state.sync.url = root.querySelector('#set-sync-url').value.trim();
-        state.sync.token = root.querySelector('#set-sync-token').value.trim();
-        savePrefs();
+      root.querySelector('#set-sync-open').onclick = () => {
         close();
-        runSync();
+        openSyncPanel();
       };
       root.querySelector('#set-import').onclick = () => {
         close();
@@ -1359,13 +1333,6 @@ function openSettings(tab = 'general') {
       };
     },
   });
-}
-
-function setSyncStatus(root, type, text) {
-  const el = root.querySelector('#sync-status');
-  if (!el) return;
-  el.className = `sync-status ${type}`;
-  root.querySelector('#sync-status-text').textContent = text;
 }
 
 function openChangePassword() {
@@ -1843,21 +1810,440 @@ function dateStamp() {
 
 /* ============================== 同步 ============================== */
 
+/* ============================== 局域网同步 ============================== */
+
+function activeDevice() {
+  return state.sync.devices.find((d) => d.id === state.sync.activeId) || null;
+}
+
+function originDevice() {
+  return state.sync.devices.find((d) => sameOrigin(d.url, location.origin)) || null;
+}
+
+/** 手机通过 HTTPS 打开页面时，跨设备请求需要由「提供页面的设备」中继 */
+function needsRelay(url) {
+  return location.protocol === 'https:' && !sameOrigin(url, location.origin);
+}
+
+function makeClient(device, code) {
+  const relay = needsRelay(device.url)
+    ? { baseUrl: location.origin, code: originDevice()?.code || '' }
+    : null;
+  // 中继由服务端发起，走对方的 HTTP 端口即可，避免自签名证书问题
+  const baseUrl = relay ? device.httpUrl || device.url : device.url;
+  return new SyncClient({ baseUrl, code: code ?? device.code, relay });
+}
+
+function syncSummary() {
+  const dev = activeDevice();
+  if (!dev) return '尚未配对设备';
+  return `已配对：${dev.name}${state.sync.lastSyncAt ? ` · 上次同步 ${relativeTime(state.sync.lastSyncAt)}` : ''}`;
+}
+
+function saveDevice(device) {
+  const idx = state.sync.devices.findIndex(
+    (d) => d.id === device.id || sameOrigin(d.url, device.url),
+  );
+  if (idx >= 0) state.sync.devices[idx] = { ...state.sync.devices[idx], ...device };
+  else state.sync.devices.push(device);
+  state.sync.activeId = device.id;
+  savePrefs();
+}
+
+function removeDevice(id) {
+  state.sync.devices = state.sync.devices.filter((d) => d.id !== id);
+  if (state.sync.activeId === id) state.sync.activeId = state.sync.devices[0]?.id || null;
+  savePrefs();
+}
+
+function drawQr(container, text) {
+  if (!container) return;
+  if (typeof window.qrcode !== 'function') {
+    container.textContent = '二维码组件未加载';
+    return;
+  }
+  try {
+    const qr = window.qrcode(0, 'M');
+    qr.addData(text);
+    qr.make();
+    container.innerHTML = qr.createSvgTag({ cellSize: 4, margin: 2, scalable: true });
+  } catch {
+    container.textContent = '';
+  }
+}
+
+function deviceRow({ name, host, url, httpUrl, platform, self }) {
+  const paired = state.sync.devices.some((d) => sameOrigin(d.url, url));
+  return `<div class="device-row">
+    <span class="avatar" style="background:${colorOf(name)}">${escapeHtml(initialsOf(name))}</span>
+    <div class="device-main">
+      <b>${escapeHtml(name)}${self ? ' <span class="badge">本机</span>' : ''}</b>
+      <span>${escapeHtml(host || '')}${platform ? ` · ${escapeHtml(platform)}` : ''}</span>
+    </div>
+    <button class="btn sm ${paired ? 'ghost' : 'primary'}" data-pair-url="${escapeHtml(url)}" data-pair-http="${escapeHtml(httpUrl || url)}" data-pair-name="${escapeHtml(name)}">
+      ${paired ? '重新配对' : '配对'}
+    </button>
+  </div>`;
+}
+
+function openSyncPanel() {
+  let timer = null;
+  openModal({
+    title: '局域网同步',
+    wide: true,
+    body: `
+      <div id="sync-current"></div>
+      <div id="sync-self"></div>
+      <div class="section-title">附近的设备</div>
+      <div id="sync-nearby"><div class="empty-list" style="padding:16px">正在搜索局域网设备…</div></div>
+      <div class="section-title">已配对设备</div>
+      <div id="sync-paired"></div>
+      <div style="display:flex;gap:8px;margin-top:16px;flex-wrap:wrap">
+        <button class="btn sm ghost" id="sync-manual">手动添加</button>
+        <button class="btn sm ghost" id="sync-scan">扫描二维码</button>
+        <button class="btn sm ghost" id="sync-refresh">刷新</button>
+      </div>`,
+    footer: `<button class="btn primary" data-close>完成</button>`,
+    onMount(root, close) {
+      const currentEl = root.querySelector('#sync-current');
+      const selfEl = root.querySelector('#sync-self');
+      const nearbyEl = root.querySelector('#sync-nearby');
+      const pairedEl = root.querySelector('#sync-paired');
+
+      const renderCurrent = () => {
+        const dev = activeDevice();
+        if (!dev) {
+          currentEl.innerHTML = '';
+          return;
+        }
+        currentEl.innerHTML = `<div class="device-row active">
+          <span class="avatar" style="background:${colorOf(dev.name)}">${escapeHtml(initialsOf(dev.name))}</span>
+          <div class="device-main"><b>${escapeHtml(dev.name)}</b>
+            <span>${escapeHtml(hostOf(dev.url) || dev.url)}${state.sync.lastSyncAt ? ` · 上次同步 ${relativeTime(state.sync.lastSyncAt)}` : ''}</span></div>
+          <button class="btn sm primary" id="sync-now">立即同步</button>
+        </div>`;
+        currentEl.querySelector('#sync-now').onclick = () => {
+          close();
+          runSync();
+        };
+      };
+
+      const renderPaired = () => {
+        const list = state.sync.devices;
+        if (!list.length) {
+          pairedEl.innerHTML = `<div class="empty-list" style="padding:14px">还没有配对设备</div>`;
+          return;
+        }
+        pairedEl.innerHTML = list
+          .map(
+            (d) => `<div class="device-row ${d.id === state.sync.activeId ? 'active' : ''}">
+              <span class="avatar" style="background:${colorOf(d.name)}">${escapeHtml(initialsOf(d.name))}</span>
+              <div class="device-main"><b>${escapeHtml(d.name)}</b><span>${escapeHtml(hostOf(d.url) || d.url)}</span></div>
+              <button class="btn sm ghost" data-sync="${d.id}">同步</button>
+              <button class="btn sm ghost" data-remove="${d.id}">移除</button>
+            </div>`,
+          )
+          .join('');
+      };
+
+      const renderNearby = async () => {
+        try {
+          const data = await fetchDiscovery();
+          const rows = [];
+          const useHttps = location.protocol === 'https:';
+          if (data.self) {
+            rows.push(
+              deviceRow({
+                name: data.self.name,
+                host: data.self.addresses?.[0]?.address || '127.0.0.1',
+                url: location.origin,
+                httpUrl: `http://${data.self.addresses?.[0]?.address || '127.0.0.1'}:${data.self.httpPort}`,
+                self: true,
+              }),
+            );
+          }
+          for (const peer of data.peers || []) {
+            const httpUrl = `http://${peer.host}:${peer.httpPort}`;
+            const url = useHttps && peer.httpsPort ? `https://${peer.host}:${peer.httpsPort}` : httpUrl;
+            rows.push(
+              deviceRow({
+                name: peer.name,
+                host: `${peer.host}:${peer.httpPort}`,
+                url,
+                httpUrl,
+                platform: peer.platform,
+              }),
+            );
+          }
+          const html =
+            rows.join('') ||
+            `<div class="empty-list" style="padding:14px">没有发现其他设备<br>请确认对方已启动密码保险库</div>`;
+          if (nearbyEl.dataset.html !== html) {
+            nearbyEl.dataset.html = html;
+            nearbyEl.innerHTML = html;
+          }
+        } catch {
+          const html = `<div class="empty-list" style="padding:14px">当前页面无法获取设备列表<br>（需要由电脑端服务提供页面）</div>`;
+          if (nearbyEl.dataset.html !== html) {
+            nearbyEl.dataset.html = html;
+            nearbyEl.innerHTML = html;
+          }
+        }
+      };
+
+      const renderSelf = async () => {
+        // 配对码只在本机可见，其他设备不请求，避免无谓的 403
+        const isLocal =
+          location.hostname === '127.0.0.1' ||
+          location.hostname === 'localhost' ||
+          location.hostname === '::1' ||
+          location.hostname === '[::1]';
+        if (!isLocal) {
+          selfEl.innerHTML = '';
+          return;
+        }
+        const info = await fetchPairingInfo().catch(() => null);
+        if (!info) {
+          selfEl.innerHTML = '';
+          return;
+        }
+        const ip = info.addresses?.[0]?.address || '127.0.0.1';
+        const addr = info.httpsPort ? `https://${ip}:${info.httpsPort}` : `http://${ip}:${info.httpPort}`;
+        selfEl.innerHTML = `
+          <div class="pair-card">
+            <div class="pair-qr" id="pair-qr"></div>
+            <div class="pair-info">
+              <div class="pair-label">本机配对码</div>
+              <div class="pair-code" id="pair-code-value">${escapeHtml(info.code)}</div>
+              <div class="pair-addr">${escapeHtml(addr)}</div>
+              <button class="btn sm ghost" id="pair-rotate">换一个配对码</button>
+            </div>
+          </div>`;
+        drawQr(selfEl.querySelector('#pair-qr'), addr);
+        selfEl.querySelector('#pair-rotate').onclick = async () => {
+          try {
+            const res = await rotatePairingCode();
+            selfEl.querySelector('#pair-code-value').textContent = res.code;
+            toast('配对码已更新', 'ok');
+          } catch (err) {
+            toast(err.message, 'err');
+          }
+        };
+      };
+
+      root.addEventListener('click', async (ev) => {
+        const pairBtn = ev.target.closest('[data-pair-url]');
+        if (pairBtn) {
+          openPairDialog({
+            name: pairBtn.dataset.pairName,
+            url: pairBtn.dataset.pairUrl,
+            httpUrl: pairBtn.dataset.pairHttp,
+          });
+          return;
+        }
+        const syncBtn = ev.target.closest('[data-sync]');
+        if (syncBtn) {
+          state.sync.activeId = syncBtn.dataset.sync;
+          savePrefs();
+          close();
+          runSync();
+          return;
+        }
+        const removeBtn = ev.target.closest('[data-remove]');
+        if (removeBtn) {
+          removeDevice(removeBtn.dataset.remove);
+          renderPaired();
+          toast('已移除该设备', 'ok');
+        }
+      });
+
+      root.querySelector('#sync-refresh').onclick = () => {
+        renderNearby();
+        renderSelf();
+      };
+      root.querySelector('#sync-manual').onclick = () => {
+        openManualPairDialog();
+      };
+      root.querySelector('#sync-scan').onclick = () => {
+        openQrScanner({
+          title: '扫描配对二维码',
+          onScan: (text) => {
+            const url = String(text).replace(/^passvault:\/\/pair\?url=/, '');
+            if (!/^https?:\/\//i.test(url)) {
+              toast('二维码内容不是有效的设备地址', 'err');
+              return;
+            }
+            openPairDialog({ name: hostOf(url) || '设备', url });
+          },
+        });
+      };
+
+      renderCurrent();
+      renderSelf();
+      renderNearby();
+      renderPaired();
+      timer = setInterval(renderNearby, 3000);
+      const stop = () => clearInterval(timer);
+      root.querySelector('[data-close]').addEventListener('click', stop);
+      root.addEventListener('click', (ev) => {
+        if (ev.target.closest('[data-close]')) stop();
+      });
+    },
+    onClose: () => clearInterval(timer),
+  });
+}
+
+function openManualPairDialog() {
+  openModal({
+    title: '手动添加设备',
+    body: `<label class="field"><span class="field-label">设备地址</span>
+        <input id="manual-url" type="text" placeholder="https://192.168.1.10:8443" spellcheck="false">
+      </label>
+      <p class="hint">在对方设备的同步面板顶部可以看到地址与配对码。</p>`,
+    footer: `<button class="btn ghost" data-cancel>取消</button><button class="btn primary" data-ok>下一步</button>`,
+    onMount(root, close) {
+      root.querySelector('[data-cancel]').onclick = close;
+      root.querySelector('[data-ok]').onclick = () => {
+        const url = root.querySelector('#manual-url').value.trim();
+        if (!url) return;
+        close();
+        openPairDialog({ name: hostOf(url) || '设备', url });
+      };
+    },
+  });
+}
+
+function openPairDialog({ name, url, httpUrl }) {
+  openModal({
+    title: `与「${name}」配对`,
+    body: `<p class="hint" style="margin:0 0 14px">
+        在对方设备上查看 6 位配对码（电脑端同步面板顶部或启动窗口），并输入该设备保险库的主密码。</p>
+      <label class="field"><span class="field-label">配对码</span>
+        <input id="pair-code" inputmode="numeric" maxlength="6" placeholder="000000"
+          style="font-family:var(--mono);letter-spacing:.4em;font-size:22px;text-align:center">
+      </label>
+      <label class="field"><span class="field-label">主密码</span>
+        <input id="pair-pw" type="password" placeholder="对方保险库的主密码" autocomplete="current-password">
+      </label>
+      <p class="lock-error" id="pair-error" hidden></p>`,
+    footer: `<button class="btn ghost" data-cancel>取消</button>
+             <button class="btn primary" data-ok>连接</button>`,
+    onMount(root, close) {
+      const codeEl = root.querySelector('#pair-code');
+      const pwEl = root.querySelector('#pair-pw');
+      const errEl = root.querySelector('#pair-error');
+      const okBtn = root.querySelector('[data-ok]');
+      setTimeout(() => codeEl.focus(), 120);
+      const fail = (msg) => {
+        errEl.textContent = msg;
+        errEl.hidden = false;
+      };
+      const submit = async () => {
+        errEl.hidden = true;
+        const code = codeEl.value.trim();
+        const password = pwEl.value;
+        if (!/^\d{6}$/.test(code)) return fail('配对码是 6 位数字');
+        if (!password) return fail('请输入主密码');
+        okBtn.disabled = true;
+        okBtn.textContent = '连接中…';
+        try {
+          await pairWithDevice({ name, url, httpUrl, code, password });
+          close();
+        } catch (err) {
+          fail(err.message || '连接失败');
+        } finally {
+          okBtn.disabled = false;
+          okBtn.textContent = '连接';
+        }
+      };
+      okBtn.onclick = submit;
+      root.querySelector('[data-cancel]').onclick = close;
+      pwEl.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter') submit();
+      });
+    },
+  });
+}
+
+async function pairWithDevice({ name, url, httpUrl, code, password }) {
+  const device = { id: '', name, url, httpUrl: httpUrl || url, code };
+  const client = makeClient(device, code);
+  const info = await client.info();
+  device.id = info.deviceId || uuid();
+  device.name = info.name || name;
+
+  let remoteVault = null;
+  let opened = null;
+  let remoteEnvelope = null;
+  if (info.hasVault) {
+    remoteEnvelope = await client.pull();
+    if (remoteEnvelope) {
+      try {
+        opened = await openVault(remoteEnvelope, password);
+      } catch (err) {
+        throw new Error(err.code === 'BAD_PASSWORD' ? '主密码不正确，无法解密对方保险库' : err.message);
+      }
+      remoteVault = opened.vault;
+    }
+  }
+
+  const localCount = (state.vault.entries || []).filter((e) => !e.deletedAt).length;
+  const remoteCount = (remoteVault?.entries || []).filter((e) => !e.deletedAt).length;
+
+  if (remoteVault && localCount > 0 && remoteCount > 0) {
+    const mode = await askRestoreMode(`「${device.name}」`, remoteVault);
+    if (!mode) throw new Error('已取消配对');
+    if (mode === 'replace') {
+      state.vault = remoteVault;
+      state.key = opened.key;
+      state.salt = opened.salt;
+      state.iterations = opened.iterations;
+      state.masterPassword = password;
+      state.header = opened.header;
+      state.envelope = remoteEnvelope;
+      state.dirty = false;
+      localStorage.setItem(LS.vault, JSON.stringify(remoteEnvelope));
+    } else {
+      const { vault } = mergeVaults(state.vault, remoteVault);
+      state.vault = vault;
+      scheduleSave();
+    }
+    render();
+  } else if (remoteVault && localCount === 0) {
+    state.vault = remoteVault;
+    state.key = opened.key;
+    state.salt = opened.salt;
+    state.iterations = opened.iterations;
+    state.masterPassword = password;
+    state.header = opened.header;
+    state.envelope = remoteEnvelope;
+    state.dirty = false;
+    localStorage.setItem(LS.vault, JSON.stringify(remoteEnvelope));
+    render();
+  }
+
+  saveDevice(device);
+  state.sync.lastSyncAt = nowISO();
+  savePrefs();
+  toast(`已与「${device.name}」配对`, 'ok');
+  return device;
+}
+
 async function runSync() {
-  if (!state.sync.url) {
-    toast('请先在设置中填写同步服务器地址', 'warn');
-    openSettings();
+  const dev = activeDevice();
+  if (!dev) {
+    openSyncPanel();
     return;
   }
   const btn = $('#sync-btn');
   btn.disabled = true;
   btn.innerHTML = '<span class="spinner"></span>';
   try {
-    const client = new SyncClient({ baseUrl: state.sync.url, token: state.sync.token });
+    const client = makeClient(dev);
     const info = await client.info();
     if (!info.hasVault) {
       await pushVault(client, 0);
-      toast('已上传保险库到服务器', 'ok');
+      toast('已上传保险库到该设备', 'ok');
       return;
     }
     const remote = await client.pull();
@@ -1866,7 +2252,7 @@ async function runSync() {
     if (remoteRev === state.header.revision) {
       if (state.dirty) {
         await pushVault(client, remoteRev);
-        toast('已同步到服务器', 'ok');
+        toast('已同步到该设备', 'ok');
       } else {
         toast('已是最新版本', 'ok');
       }
@@ -1876,17 +2262,17 @@ async function runSync() {
     if (remoteRev > state.header.revision) {
       if (!state.dirty) {
         await adoptRemote(remote);
-        toast('已从服务器更新', 'ok');
+        toast('已从该设备更新', 'ok');
         return;
       }
       const choice = await askConflict(remote);
       if (!choice) return;
       if (choice === 'remote') {
         await adoptRemote(remote);
-        toast('已使用服务器版本', 'ok');
+        toast('已使用对方版本', 'ok');
       } else if (choice === 'local') {
         await pushVault(client, remoteRev);
-        toast('已用本地版本覆盖服务器', 'ok');
+        toast('已用本机版本覆盖对方', 'ok');
       } else {
         const remoteVault = await decryptRemote(remote);
         const { vault, stats } = mergeVaults(state.vault, remoteVault);
@@ -1898,12 +2284,14 @@ async function runSync() {
       return;
     }
 
-    // 服务器版本落后于本地基线
     await pushVault(client, remoteRev);
-    toast('已同步到服务器', 'ok');
+    toast('已同步到该设备', 'ok');
   } catch (err) {
-    if (err instanceof SyncError) toast(err.message, 'err', 4000);
-    else toast(err.message || '同步失败', 'err', 4000);
+    if (err instanceof SyncError) {
+      toast(err.code === 'UNAUTHORIZED' ? '配对码已失效，请重新配对' : err.message, 'err', 4000);
+    } else {
+      toast(err.message || '同步失败', 'err', 4000);
+    }
   } finally {
     btn.disabled = false;
     btn.innerHTML = icon('refresh');
@@ -2070,7 +2458,7 @@ function bindEvents() {
   $('#gen-btn').addEventListener('click', () => openGenerator());
   $('#settings-btn').addEventListener('click', () => openSettings());
   $('#lock-btn').addEventListener('click', () => lockVault());
-  $('#sync-btn').addEventListener('click', runSync);
+  $('#sync-btn').addEventListener('click', () => openSyncPanel());
   $('#menu-btn').addEventListener('click', () => {
     $('#main').classList.remove('detail-open');
   });

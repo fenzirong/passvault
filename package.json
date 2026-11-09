@@ -1,7 +1,7 @@
 {
   "name": "dsh-passvault",
   "productName": "PassVault",
-  "version": "1.1.2",
+  "version": "1.2.0",
   "private": true,
   "type": "module",
   "description": "本地加密的密码保险库：Windows 桌面版 / 安卓 App，支持 2FA、扫码、密码生成与局域网同步",

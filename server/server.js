@@ -70,9 +70,9 @@ function printBanner(server) {
       console.log(`     https://${a.address}:${info.httpsPort}`);
     }
   }
-  if (info.token) {
-    console.log(`\n  同步口令：${info.token}`);
-    console.log('  （在手机/其他电脑的“设置 → 局域网同步”中填写地址与口令）');
+  if (info.pairingCode) {
+    console.log(`\n  配对码：${info.pairingCode}`);
+    console.log('  （手机打开上面的 HTTPS 地址后，在「局域网同步」里选择本机并输入配对码 + 主密码）');
   } else {
     console.log('\n  ⚠️  已关闭口令校验（--no-auth），请仅在可信网络中使用');
   }

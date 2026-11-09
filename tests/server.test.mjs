@@ -151,3 +151,47 @@ test('嵌入式启动（Electron 使用）：随机端口 + 可关闭', async ()
     fs.rmSync(dataDir, { recursive: true, force: true });
   }
 });
+
+test('配对码：本机可读、局域网不可读、可用于鉴权', async () => {
+  const { PassVaultServer } = await import('../server/app.js');
+  const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'passvault-pair-'));
+  const server = new PassVaultServer({
+    port: 0,
+    httpsPort: 0,
+    host: '0.0.0.0',
+    dataDir,
+    quiet: true,
+  });
+  const info = await server.start();
+  try {
+    assert.match(info.pairingCode, /^\d{6}$/);
+
+    // 本机读取配对码
+    const local = await fetch(`http://127.0.0.1:${info.httpPort}/api/pairing`);
+    assert.equal(local.status, 200);
+    const localJson = await local.json();
+    assert.equal(localJson.code, info.pairingCode);
+
+    // 用配对码访问受保护接口
+    const ok = await fetch(`http://127.0.0.1:${info.httpPort}/api/vault`, {
+      headers: { 'X-Pair-Code': info.pairingCode },
+    });
+    assert.equal(ok.status, 404); // 还没有保险库，但鉴权已通过
+
+    // 错误配对码
+    const bad = await fetch(`http://127.0.0.1:${info.httpPort}/api/vault`, {
+      headers: { 'X-Pair-Code': '000000' },
+    });
+    assert.equal(bad.status, 401);
+
+    // 设备发现接口（公开）
+    const disc = await fetch(`http://127.0.0.1:${info.httpPort}/api/discovery`);
+    assert.equal(disc.status, 200);
+    const discJson = await disc.json();
+    assert.equal(discJson.self.id, info.deviceId);
+    assert.ok(Array.isArray(discJson.peers));
+  } finally {
+    await server.close();
+    fs.rmSync(dataDir, { recursive: true, force: true });
+  }
+});
