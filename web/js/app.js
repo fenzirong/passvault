@@ -121,6 +121,8 @@ const state = {
   selectedId: null,
   revealed: new Set(),
   sync: { devices: [], activeId: null, lastSyncAt: null },
+  pendingPairCode: null,
+  isServerHost: false,
   ui: { theme: 'dark' },
   deviceId: '',
   saveTimer: null,
@@ -138,6 +140,19 @@ function init() {
   if (!globalThis.crypto?.subtle) {
     showInsecureNotice();
     return;
+  }
+  const isLocalHost = ['127.0.0.1', 'localhost', '::1', '[::1]'].includes(location.hostname);
+  if (isLocalHost) {
+    fetchPairingInfo()
+      .then((info) => {
+        state.isServerHost = Boolean(info);
+      })
+      .catch(() => {});
+  }
+  const hashPair = location.hash.match(/[#&]pair=(\d{6})/);
+  if (hashPair) {
+    state.pendingPairCode = hashPair[1];
+    history.replaceState(null, '', location.pathname + location.search);
   }
   if (window.innerWidth < 480) {
     $('#search').placeholder = '搜索…';
@@ -259,6 +274,14 @@ function showLock(mode) {
   $('#master-password').value = '';
   $('#master-password2').value = '';
   $('#lock-error').hidden = true;
+  const importBtn = $('#lock-import');
+  const pairHint = $('#pair-hint');
+  const canImport = mode === 'create' && Boolean(state.pendingPairCode);
+  importBtn.hidden = !canImport;
+  pairHint.hidden = !canImport;
+  if (canImport) {
+    pairHint.textContent = `已识别配对码 ${state.pendingPairCode}，输入电脑的主密码即可导入`;
+  }
   const bio = bioRecord();
   const bioBtn = $('#bio-unlock');
   bioBtn.hidden = !bio;
@@ -338,6 +361,45 @@ async function handleLockSubmit(event) {
   }
 }
 
+async function importFromPeerOnLock() {
+  const code = state.pendingPairCode;
+  if (!code) return;
+  const password = await promptPassword({
+    title: '从电脑导入',
+    message: '输入电脑上那个保险库的主密码，导入后本机将使用同一份数据。',
+    okText: '导入',
+  });
+  if (!password) return;
+  try {
+    const client = new SyncClient({ baseUrl: location.origin, code });
+    const info = await client.info();
+    if (!info.hasVault) throw new Error('这台设备还没有保险库');
+    const remote = await client.pull();
+    const opened = await openVault(remote, password);
+    state.key = opened.key;
+    state.salt = opened.salt;
+    state.iterations = opened.iterations;
+    state.masterPassword = password;
+    state.vault = opened.vault;
+    state.header = opened.header;
+    state.envelope = remote;
+    state.dirty = false;
+    localStorage.setItem(LS.vault, JSON.stringify(remote));
+    saveDevice({
+      id: info.deviceId || uuid(),
+      name: info.name || '电脑',
+      url: location.origin,
+      httpUrl: location.origin,
+      code,
+    });
+    state.pendingPairCode = null;
+    enterApp();
+    toast('导入成功，已与电脑配对', 'ok');
+  } catch (err) {
+    lockError(err.code === 'BAD_PASSWORD' ? '主密码不正确' : err.message || '导入失败');
+  }
+}
+
 async function unlockWithBiometric() {
   const btn = $('#bio-unlock');
   btn.disabled = true;
@@ -379,6 +441,7 @@ function enterApp() {
   render();
   startTotpTicker();
   resetIdle();
+  startShadowHeartbeat();
 }
 
 function lockVault(silent = false) {
@@ -390,6 +453,7 @@ function lockVault(silent = false) {
   state.selectedId = null;
   state.revealed.clear();
   stopTotpTicker();
+  stopShadowHeartbeat();
   closeAllModals();
   $('#main').hidden = true;
   $('#main').classList.remove('detail-open');
@@ -419,6 +483,7 @@ async function persist() {
   state.envelope = env;
   localStorage.setItem(LS.vault, JSON.stringify(env));
   recordSnapshot(env);
+  if (state.isServerHost) syncWithSelfServer();
 }
 
 function settings() {
@@ -1312,7 +1377,7 @@ function openSettings(tab = 'general') {
 
     <div class="section-title">关于</div>
     <p class="hint" style="margin:0">
-      密码保险库 v1.3.0 · 本地加密，零依赖。<br>
+      密码保险库 v1.4.0 · 本地加密，零依赖。<br>
       加密：PBKDF2-SHA256（${KDF_ITERATIONS.toLocaleString()} 次）+ AES-256-GCM；2FA：RFC 6238 TOTP。<br>
       参考开源项目：KeePassXC、KeePassDX、Bitwarden、Aegis Authenticator；二维码解码使用 jsQR（Apache-2.0）。
     </p>
@@ -1960,12 +2025,14 @@ function drawQr(container, text) {
   }
 }
 
-function deviceRow({ name, host, url, httpUrl, platform, self }) {
+function deviceRow({ name, host, url, httpUrl, platform, self, selfLabel = '本机', kind = 'pc' }) {
   const paired = state.sync.devices.some((d) => sameOrigin(d.url, url));
   return `<div class="device-row">
     <span class="avatar" style="background:${colorOf(name)}">${escapeHtml(initialsOf(name))}</span>
     <div class="device-main">
-      <b>${escapeHtml(name)}${self ? ' <span class="badge">本机</span>' : ''}</b>
+      <b>${escapeHtml(name)}${self ? ` <span class="badge">${escapeHtml(selfLabel)}</span>` : ''}${
+        kind === 'phone' ? ' <span class="badge note">手机</span>' : ''
+      }</b>
       <span>${escapeHtml(host || '')}${platform ? ` · ${escapeHtml(platform)}` : ''}</span>
     </div>
     <button class="btn sm ${paired ? 'ghost' : 'primary'}" data-pair-url="${escapeHtml(url)}" data-pair-http="${escapeHtml(httpUrl || url)}" data-pair-name="${escapeHtml(name)}">
@@ -1975,6 +2042,7 @@ function deviceRow({ name, host, url, httpUrl, platform, self }) {
 }
 
 function openSyncPanel() {
+  if (state.isServerHost) syncWithSelfServer();
   let timer = null;
   openModal({
     title: '局域网同步',
@@ -2039,6 +2107,10 @@ function openSyncPanel() {
           const data = await fetchDiscovery();
           const rows = [];
           const useHttps = location.protocol === 'https:';
+          const isLocalPage =
+            location.hostname === '127.0.0.1' ||
+            location.hostname === 'localhost' ||
+            location.hostname === '::1';
           if (data.self) {
             rows.push(
               deviceRow({
@@ -2047,12 +2119,17 @@ function openSyncPanel() {
                 url: location.origin,
                 httpUrl: `http://${data.self.addresses?.[0]?.address || '127.0.0.1'}:${data.self.httpPort}`,
                 self: true,
+                selfLabel: isLocalPage ? '本机' : '当前服务器',
               }),
             );
           }
           for (const peer of data.peers || []) {
-            const httpUrl = `http://${peer.host}:${peer.httpPort}`;
-            const url = useHttps && peer.httpsPort ? `https://${peer.host}:${peer.httpsPort}` : httpUrl;
+            // 自己的影子设备不显示
+            if (peer.shadow && peer.shadowId === state.deviceId) continue;
+            const suffix = peer.shadow ? `/shadow/${encodeURIComponent(peer.shadowId)}` : '';
+            const httpUrl = `http://${peer.host}:${peer.httpPort}${suffix}`;
+            const url =
+              useHttps && peer.httpsPort ? `https://${peer.host}:${peer.httpsPort}${suffix}` : httpUrl;
             rows.push(
               deviceRow({
                 name: peer.name,
@@ -2060,6 +2137,7 @@ function openSyncPanel() {
                 url,
                 httpUrl,
                 platform: peer.platform,
+                kind: peer.shadow ? 'phone' : 'pc',
               }),
             );
           }
@@ -2107,7 +2185,7 @@ function openSyncPanel() {
               <button class="btn sm ghost" id="pair-rotate">换一个配对码</button>
             </div>
           </div>`;
-        drawQr(selfEl.querySelector('#pair-qr'), addr);
+        drawQr(selfEl.querySelector('#pair-qr'), `${addr}/#pair=${info.code}`);
         selfEl.querySelector('#pair-rotate').onclick = async () => {
           try {
             const res = await rotatePairingCode();
@@ -2156,12 +2234,20 @@ function openSyncPanel() {
         openQrScanner({
           title: '扫描配对二维码',
           onScan: (text) => {
-            const url = String(text).replace(/^passvault:\/\/pair\?url=/, '');
+            const raw = String(text).trim();
+            const m = raw.match(/[#&?](?:pair|code)=(\d{6})/);
+            const code = m ? m[1] : '';
+            const url = raw.replace(/#.*$/, '');
             if (!/^https?:\/\//i.test(url)) {
               toast('二维码内容不是有效的设备地址', 'err');
               return;
             }
-            openPairDialog({ name: hostOf(url) || '设备', url });
+            openPairDialog({
+              name: hostOf(url) || '设备',
+              url,
+              httpUrl: url.replace(/^https:/, 'http:').replace(/:8443\b/, ':8787'),
+              code,
+            });
           },
         });
       };
@@ -2201,13 +2287,13 @@ function openManualPairDialog() {
   });
 }
 
-function openPairDialog({ name, url, httpUrl }) {
+function openPairDialog({ name, url, httpUrl, code: presetCode = '' }) {
   openModal({
     title: `与「${name}」配对`,
     body: `<p class="hint" style="margin:0 0 14px">
         在对方设备上查看 6 位配对码（电脑端同步面板顶部或启动窗口），并输入该设备保险库的主密码。</p>
       <label class="field"><span class="field-label">配对码</span>
-        <input id="pair-code" inputmode="numeric" maxlength="6" placeholder="000000"
+        <input id="pair-code" inputmode="numeric" maxlength="6" placeholder="000000" value="${escapeHtml(presetCode)}"
           style="font-family:var(--mono);letter-spacing:.4em;font-size:22px;text-align:center">
       </label>
       <label class="field"><span class="field-label">主密码</span>
@@ -2221,7 +2307,7 @@ function openPairDialog({ name, url, httpUrl }) {
       const pwEl = root.querySelector('#pair-pw');
       const errEl = root.querySelector('#pair-error');
       const okBtn = root.querySelector('[data-ok]');
-      setTimeout(() => codeEl.focus(), 120);
+      setTimeout(() => (presetCode ? pwEl.focus() : codeEl.focus()), 120);
       const fail = (msg) => {
         errEl.textContent = msg;
         errEl.hidden = false;
@@ -2317,6 +2403,111 @@ async function pairWithDevice({ name, url, httpUrl, code, password }) {
   savePrefs();
   toast(`已与「${device.name}」配对`, 'ok');
   return device;
+}
+
+let selfSyncTimer = null;
+
+/** 电脑端：把本机保险库同步到自己内嵌的服务端，供手机导入 / 其他设备拉取 */
+function syncWithSelfServer() {
+  clearTimeout(selfSyncTimer);
+  selfSyncTimer = setTimeout(async () => {
+    if (!state.isServerHost || !state.unlocked) return;
+    try {
+      const info = await fetchPairingInfo();
+      if (!info?.code) return;
+      const client = new SyncClient({ baseUrl: location.origin, code: info.code });
+      const remote = await client.info();
+      if (!remote.hasVault) {
+        await pushVault(client, 0);
+        return;
+      }
+      if (remote.revision > state.header.revision) {
+        const envelope = await client.pull();
+        if (!envelope) return;
+        if (!state.dirty) {
+          await adoptRemote(envelope);
+        } else {
+          const remoteVault = await decryptWithKey(envelope, state.key);
+          const { vault } = mergeVaults(state.vault, remoteVault);
+          state.vault = vault;
+          await pushVault(client, remote.revision);
+          render();
+        }
+        return;
+      }
+      if (state.dirty) await pushVault(client, remote.revision);
+    } catch {
+      /* 忽略：离线或服务端未就绪 */
+    }
+  }, 800);
+}
+
+let shadowTimer = null;
+let shadowBusy = false;
+
+function deviceDisplayName() {
+  const ua = navigator.userAgent || '';
+  if (/Android/i.test(ua)) return '安卓手机';
+  if (/iPhone|iPad/i.test(ua)) return 'iPhone';
+  return '浏览器';
+}
+
+/** 把自己的加密保险库寄放在「提供页面的那台电脑」上，让其他设备能发现并同步 */
+async function shadowHeartbeat() {
+  const dev = originDevice();
+  if (!dev || !state.envelope || shadowBusy) return;
+  shadowBusy = true;
+  try {
+    const res = await fetch('/api/shadow/register', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Pair-Code': dev.code },
+      body: JSON.stringify({
+        id: state.deviceId,
+        name: deviceDisplayName(),
+        platform: navigator.platform || '',
+        envelope: state.envelope,
+      }),
+    });
+    if (!res.ok) return;
+    const data = await res.json();
+    if (data?.pending) await applyShadowPending(data.pending);
+  } catch {
+    /* 网络抖动忽略 */
+  } finally {
+    shadowBusy = false;
+  }
+}
+
+async function applyShadowPending(envelope) {
+  const rev = Number(envelope?.header?.revision || 0);
+  if (!rev || rev <= state.header.revision) return;
+  const remoteVault = await decryptWithKey(envelope, state.key);
+  const { vault } = mergeVaults(state.vault, remoteVault);
+  state.vault = vault;
+  const header = { revision: rev, updatedAt: nowISO(), deviceId: state.deviceId };
+  const env = await sealVault(state.vault, state.key, {
+    salt: state.salt,
+    iterations: state.iterations,
+    header,
+  });
+  state.header = header;
+  state.envelope = env;
+  state.dirty = false;
+  localStorage.setItem(LS.vault, JSON.stringify(env));
+  render();
+  toast('已接收其他设备推送的更新', 'ok');
+}
+
+function startShadowHeartbeat() {
+  stopShadowHeartbeat();
+  if (!originDevice()) return;
+  shadowHeartbeat();
+  shadowTimer = setInterval(shadowHeartbeat, 8000);
+}
+
+function stopShadowHeartbeat() {
+  if (shadowTimer) clearInterval(shadowTimer);
+  shadowTimer = null;
 }
 
 async function runSync() {
@@ -2505,6 +2696,7 @@ function bindEvents() {
     $('#toggle-pw').innerHTML = icon(isPw ? 'eye-off' : 'eye');
   });
   $('#bio-unlock').addEventListener('click', unlockWithBiometric);
+  $('#lock-import').addEventListener('click', importFromPeerOnLock);
   $('#theme-btn').addEventListener('click', toggleTheme);
   $('#restore-btn').addEventListener('click', restoreFromFile);
 

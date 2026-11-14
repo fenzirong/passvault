@@ -104,11 +104,11 @@ jobs:
           if [ -f release.keystore ]; then
             export KEYSTORE_FILE="$PWD/release.keystore"
             ./gradlew assembleRelease --no-daemon --stacktrace
-            cp app/build/outputs/apk/release/app-release.apk ../dist-apk/PassVault-1.3.0-release.apk
+            cp app/build/outputs/apk/release/app-release.apk ../dist-apk/PassVault-1.4.0-release.apk
             echo "✅ 已生成签名 release APK"
           else
             ./gradlew assembleDebug --no-daemon --stacktrace
-            cp app/build/outputs/apk/debug/app-debug.apk ../dist-apk/PassVault-1.3.0-debug.apk
+            cp app/build/outputs/apk/debug/app-debug.apk ../dist-apk/PassVault-1.4.0-debug.apk
             echo "⚠️ 未找到签名密钥，退回 debug APK"
           fi
       - uses: actions/upload-artifact@v4

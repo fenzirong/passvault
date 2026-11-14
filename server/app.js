@@ -70,6 +70,7 @@ export class PassVaultServer {
     this.pairingCode = '';
     this.deviceId = '';
     this.discovery = null;
+    this.shadows = new Map();
     this.servers = [];
     this.httpPort = 0;
     this.httpsPort = 0;
@@ -339,7 +340,7 @@ export class PassVaultServer {
               httpsPort: this.httpsPort,
               addresses: lanAddresses(),
             },
-        peers: this.discovery ? this.discovery.list() : [],
+        peers: this.discoveryList(),
       });
       return;
     }
@@ -365,6 +366,18 @@ export class PassVaultServer {
 
     if (!this.checkAuth(req)) {
       this.sendJson(res, 401, { error: '配对码不正确' });
+      return;
+    }
+
+    // ---------------- 影子设备（手机等） ----------------
+    if (pathname === '/api/shadow/register' && req.method === 'POST') {
+      await this.handleShadowRegister(req, res);
+      return;
+    }
+
+    const shadowMatch = pathname.match(/^\/shadow\/([^/]+)\/api\/(info|vault)$/);
+    if (shadowMatch) {
+      await this.handleShadowApi(req, res, decodeURIComponent(shadowMatch[1]), shadowMatch[2]);
       return;
     }
 
@@ -447,6 +460,171 @@ export class PassVaultServer {
     this.sendJson(res, 404, { error: '接口不存在' });
   }
 
+  /* ------------------------------ 影子设备 ------------------------------ */
+  // 手机没有服务端，无法自己监听端口；它把加密保险库「寄放」在电脑上，
+  // 电脑以 /shadow/<id>/api/* 的形式对外提供，其他设备即可像普通设备一样访问。
+
+  loadShadows() {
+    try {
+      const raw = fs.readFileSync(path.join(this.dataDir, 'shadows.json'), 'utf8');
+      const obj = JSON.parse(raw);
+      this.shadows = new Map(Object.entries(obj || {}));
+    } catch {
+      this.shadows = new Map();
+    }
+  }
+
+  saveShadows() {
+    try {
+      fs.writeFileSync(
+        path.join(this.dataDir, 'shadows.json'),
+        JSON.stringify(Object.fromEntries(this.shadows)),
+        { mode: 0o600 },
+      );
+    } catch (err) {
+      console.warn('[warn] 保存影子设备失败：', err.message);
+    }
+  }
+
+  discoveryList() {
+    const peers = this.discovery ? this.discovery.list() : [];
+    const ip = lanAddresses()[0]?.address || '127.0.0.1';
+    const now = Date.now();
+    for (const s of this.shadows.values()) {
+      if (now - (s.lastSeen || 0) > 90_000) continue;
+      peers.push({
+        id: `shadow:${s.id}`,
+        name: s.name,
+        host: ip,
+        httpPort: this.httpPort,
+        httpsPort: this.httpsPort,
+        platform: s.platform,
+        shadow: true,
+        shadowId: s.id,
+        lastSeen: s.lastSeen,
+      });
+    }
+    return peers;
+  }
+
+  async handleShadowRegister(req, res) {
+    let body;
+    try {
+      body = JSON.parse(await this.readBody(req));
+    } catch {
+      this.sendJson(res, 400, { error: '请求体不是合法 JSON' });
+      return;
+    }
+    const id = String(body?.id || '').trim();
+    if (!id) {
+      this.sendJson(res, 400, { error: '缺少设备 id' });
+      return;
+    }
+    const prev = this.shadows.get(id) || {};
+    const revision = Number(body.envelope?.header?.revision ?? prev.revision ?? 0);
+    const shadow = {
+      id,
+      name: String(body.name || prev.name || '手机'),
+      platform: String(body.platform || prev.platform || ''),
+      envelope: body.envelope || prev.envelope || null,
+      revision,
+      updatedAt: body.envelope?.header?.updatedAt || prev.updatedAt || null,
+      lastSeen: Date.now(),
+      pending: prev.pending || null,
+    };
+    // 手机已经应用了这个待同步版本
+    if (shadow.pending && revision >= Number(shadow.pending.envelope?.header?.revision || 0)) {
+      shadow.pending = null;
+    }
+    this.shadows.set(id, shadow);
+    this.saveShadows();
+    this.sendJson(res, 200, {
+      ok: true,
+      revision: shadow.revision,
+      pending: shadow.pending ? shadow.pending.envelope : null,
+    });
+  }
+
+  async handleShadowApi(req, res, id, kind) {
+    const shadow = this.shadows.get(id);
+    if (!shadow) {
+      this.sendJson(res, 404, { error: '设备不存在' });
+      return;
+    }
+    if (kind === 'info') {
+      this.sendJson(res, 200, {
+        app: 'dsh-passvault',
+        version: 2,
+        name: shadow.name,
+        deviceId: shadow.id,
+        revision: shadow.revision,
+        updatedAt: shadow.updatedAt,
+        hasVault: Boolean(shadow.envelope),
+        authRequired: true,
+        shadow: true,
+        online: Date.now() - (shadow.lastSeen || 0) < 90_000,
+      });
+      return;
+    }
+
+    if (req.method === 'GET') {
+      if (!shadow.envelope) {
+        this.sendJson(res, 404, { error: '该设备还没有保险库' });
+        return;
+      }
+      res.writeHead(200, {
+        'Content-Type': 'application/json; charset=utf-8',
+        'Cache-Control': 'no-store',
+        'Access-Control-Allow-Origin': '*',
+        'Access-Control-Allow-Headers': 'Content-Type, X-Sync-Token, X-Pair-Code, If-Match',
+        'Access-Control-Expose-Headers': 'ETag',
+        ETag: `"${shadow.revision}"`,
+      });
+      res.end(JSON.stringify(shadow.envelope));
+      return;
+    }
+
+    if (req.method === 'PUT') {
+      const ifMatch = req.headers['if-match'];
+      if (ifMatch === undefined) {
+        this.sendJson(res, 428, { error: '缺少 If-Match 版本号' });
+        return;
+      }
+      const expected = Number(String(ifMatch).replace(/"/g, ''));
+      if (!Number.isFinite(expected)) {
+        this.sendJson(res, 400, { error: 'If-Match 版本号无效' });
+        return;
+      }
+      if (expected !== shadow.revision) {
+        this.sendJson(res, 409, { error: '版本冲突', revision: shadow.revision });
+        return;
+      }
+      let envelope;
+      try {
+        envelope = JSON.parse(await this.readBody(req));
+      } catch {
+        this.sendJson(res, 400, { error: '请求体不是合法 JSON' });
+        return;
+      }
+      if (
+        !envelope ||
+        envelope.format !== 'dsh-passvault' ||
+        Number(envelope.header?.revision) !== expected + 1
+      ) {
+        this.sendJson(res, 400, { error: '保险库格式不正确，或版本号不连续' });
+        return;
+      }
+      shadow.pending = { envelope, queuedAt: new Date().toISOString() };
+      this.shadows.set(id, shadow);
+      this.saveShadows();
+      this.log(`[shadow] 已排队推送给 ${shadow.name}（版本 ${expected + 1}）`);
+      this.sendJson(res, 202, { ok: true, queued: true, revision: expected + 1 });
+      return;
+    }
+
+    this.sendJson(res, 405, { error: '不支持的请求方法' });
+  }
+
   /* ------------------------------ 中继 ------------------------------ */
 
   async handleRelay(req, res) {
@@ -498,6 +676,7 @@ export class PassVaultServer {
     this.token = this.loadToken();
     this.deviceId = this.loadDeviceId();
     this.pairingCode = this.loadPairing();
+    this.loadShadows();
     this.loadState();
 
     const listen = (server, port) =>
@@ -509,7 +688,7 @@ export class PassVaultServer {
     const handler = async (req, res) => {
       const url = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
       try {
-        if (url.pathname.startsWith('/api/')) {
+        if (url.pathname.startsWith('/api/') || url.pathname.startsWith('/shadow/')) {
           await this.handleApi(req, res, url);
           return;
         }
