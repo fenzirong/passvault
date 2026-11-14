@@ -1,6 +1,7 @@
 // 应用主逻辑：状态管理、界面渲染、同步流程
 import {
   escapeHtml,
+  b64decode,
   formatDateTime,
   relativeTime,
   hostOf,
@@ -18,6 +19,8 @@ import {
   changeMasterPassword,
   assertEnvelope,
   deriveKey,
+  exportRawKey,
+  importRawKey,
   KDF_ITERATIONS,
 } from './crypto.js';
 import {
@@ -58,6 +61,15 @@ import {
   rotatePairingCode,
 } from './sync.js';
 import { openQrScanner } from './qrscan.js';
+import {
+  isSupported as bioSupported,
+  enroll as bioEnroll,
+  unlock as bioUnlock,
+  disable as bioDisable,
+  loadRecord as bioRecord,
+  clearRecord as bioClear,
+  describe as bioDescribe,
+} from './biometric.js';
 import {
   listSnapshots,
   recordSnapshot,
@@ -247,6 +259,11 @@ function showLock(mode) {
   $('#master-password').value = '';
   $('#master-password2').value = '';
   $('#lock-error').hidden = true;
+  const bio = bioRecord();
+  const bioBtn = $('#bio-unlock');
+  bioBtn.hidden = !bio;
+  bioBtn.disabled = false;
+  bioBtn.textContent = '使用指纹 / 面容解锁';
   $('#master-password').setAttribute(
     'autocomplete',
     mode === 'create' ? 'new-password' : 'current-password',
@@ -318,6 +335,34 @@ async function handleLockSubmit(event) {
   } finally {
     btn.disabled = false;
     btn.textContent = '解锁';
+  }
+}
+
+async function unlockWithBiometric() {
+  const btn = $('#bio-unlock');
+  btn.disabled = true;
+  btn.textContent = '验证中…';
+  lockError('');
+  try {
+    const raw = await bioUnlock();
+    const key = await importRawKey(raw);
+    const env = state.envelope || readLocalEnvelope();
+    if (!env) throw new Error('本机没有找到保险库');
+    const vault = await decryptWithKey(env, key);
+    state.key = key;
+    state.salt = b64decode(env.kdf.salt);
+    state.iterations = Number(env.kdf.iterations) || KDF_ITERATIONS;
+    state.masterPassword = null;
+    state.vault = vault;
+    state.header = env.header;
+    state.envelope = env;
+    state.dirty = false;
+    enterApp();
+  } catch (err) {
+    lockError(err.message || '生物识别解锁失败');
+  } finally {
+    btn.disabled = false;
+    btn.textContent = '使用指纹 / 面容解锁';
   }
 }
 
@@ -1214,6 +1259,14 @@ function openSettings(tab = 'general') {
       </select>
     </div>
     <div class="setting-row">
+      <div class="text"><b>生物识别解锁</b><span>${
+        bioRecord()
+          ? `已启用 · ${escapeHtml(bioDescribe())}`
+          : '用指纹 / 面容快速解锁，无需输入主密码（安卓 App 走系统生物识别，电脑走 Windows Hello / Touch ID）'
+      }</span></div>
+      <button class="btn sm ghost" id="set-bio">${bioRecord() ? '关闭' : '启用'}</button>
+    </div>
+    <div class="setting-row">
       <div class="text"><b>修改主密码</b><span>重新加密整个保险库</span></div>
       <button class="btn sm ghost" id="set-changepw">修改</button>
     </div>
@@ -1259,7 +1312,7 @@ function openSettings(tab = 'general') {
 
     <div class="section-title">关于</div>
     <p class="hint" style="margin:0">
-      密码保险库 v1.2.0 · 本地加密，零依赖。<br>
+      密码保险库 v1.3.0 · 本地加密，零依赖。<br>
       加密：PBKDF2-SHA256（${KDF_ITERATIONS.toLocaleString()} 次）+ AES-256-GCM；2FA：RFC 6238 TOTP。<br>
       参考开源项目：KeePassXC、KeePassDX、Bitwarden、Aegis Authenticator；二维码解码使用 jsQR（Apache-2.0）。
     </p>
@@ -1277,6 +1330,35 @@ function openSettings(tab = 'general') {
       };
       root.querySelector('#set-clipboard').onchange = (ev) => {
         updateSettings({ clipboardClearSeconds: Number(ev.target.value) });
+      };
+      root.querySelector('#set-bio').onclick = async (ev) => {
+        const btn = ev.currentTarget;
+        if (bioRecord()) {
+          await bioDisable();
+          toast('已关闭生物识别解锁', 'ok');
+          close();
+          openSettings();
+          return;
+        }
+        btn.disabled = true;
+        btn.textContent = '启用中…';
+        try {
+          const supported = await bioSupported();
+          if (!supported) {
+            toast('当前设备不支持生物识别（或未录入指纹 / 面容）', 'warn', 4000);
+            return;
+          }
+          const raw = await exportRawKey(state.key);
+          await bioEnroll(raw);
+          toast('已启用生物识别解锁', 'ok');
+          close();
+          openSettings();
+        } catch (err) {
+          toast(err.message || '启用失败', 'err', 4000);
+        } finally {
+          btn.disabled = false;
+          btn.textContent = '启用';
+        }
       };
       root.querySelector('#set-changepw').onclick = () => {
         close();
@@ -1376,8 +1458,13 @@ function openChangePassword() {
           state.header = result.header;
           state.envelope = result.envelope;
           localStorage.setItem(LS.vault, JSON.stringify(result.envelope));
+          if (bioRecord()) {
+            bioClear();
+            toast('主密码已修改，生物识别解锁已失效，请重新启用', 'warn', 4000);
+          } else {
+            toast('主密码已修改', 'ok');
+          }
           close();
-          toast('主密码已修改', 'ok');
         } catch (e) {
           err.textContent = e.code === 'BAD_PASSWORD' ? '当前主密码不正确' : e.message;
           err.hidden = false;
@@ -1638,6 +1725,7 @@ async function restoreFromEnvelope(env, label) {
       state.salt = opened.salt;
       state.iterations = opened.iterations;
       state.masterPassword = password;
+      bioClear();
     }
   } else {
     const { vault: merged } = mergeVaults(state.vault, vault);
@@ -2202,6 +2290,7 @@ async function pairWithDevice({ name, url, httpUrl, code, password }) {
       state.header = opened.header;
       state.envelope = remoteEnvelope;
       state.dirty = false;
+      bioClear();
       localStorage.setItem(LS.vault, JSON.stringify(remoteEnvelope));
     } else {
       const { vault } = mergeVaults(state.vault, remoteVault);
@@ -2218,6 +2307,7 @@ async function pairWithDevice({ name, url, httpUrl, code, password }) {
     state.header = opened.header;
     state.envelope = remoteEnvelope;
     state.dirty = false;
+    bioClear();
     localStorage.setItem(LS.vault, JSON.stringify(remoteEnvelope));
     render();
   }
@@ -2414,6 +2504,7 @@ function bindEvents() {
     input.type = isPw ? 'text' : 'password';
     $('#toggle-pw').innerHTML = icon(isPw ? 'eye-off' : 'eye');
   });
+  $('#bio-unlock').addEventListener('click', unlockWithBiometric);
   $('#theme-btn').addEventListener('click', toggleTheme);
   $('#restore-btn').addEventListener('click', restoreFromFile);
 

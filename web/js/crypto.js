@@ -19,7 +19,7 @@ export async function deriveKey(password, salt, iterations = KDF_ITERATIONS) {
     { name: 'PBKDF2', salt, iterations, hash: 'SHA-256' },
     baseKey,
     { name: 'AES-GCM', length: 256 },
-    false,
+    true, // 允许导出原始密钥，用于生物识别解锁时包裹存储
     ['encrypt', 'decrypt'],
   );
 }
@@ -91,6 +91,16 @@ export async function openVault(envelope, password) {
     throw err;
   }
   return { vault, key, salt, iterations, header: envelope.header };
+}
+
+/** 导出原始密钥字节（仅用于生物识别包裹） */
+export async function exportRawKey(key) {
+  return new Uint8Array(await subtle.exportKey('raw', key));
+}
+
+/** 从原始字节恢复 AES-GCM 密钥 */
+export async function importRawKey(raw) {
+  return subtle.importKey('raw', raw, { name: 'AES-GCM' }, true, ['encrypt', 'decrypt']);
 }
 
 /** 用已有密钥直接解密（同步时无需再次输入主密码） */

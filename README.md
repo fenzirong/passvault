@@ -14,9 +14,9 @@
 | --- | --- |
 | ![生成器](docs/screenshot-generator.png) | ![冲突](docs/screenshot-sync.png) |
 
-| 局域网设备发现与配对 |
-| --- |
-| ![同步面板](docs/screenshot-sync-panel.png) |
+| 局域网设备发现与配对 | 生物识别解锁 |
+| --- | --- |
+| ![同步面板](docs/screenshot-sync-panel.png) | ![生物识别](docs/screenshot-biometric.png) |
 
 | 自动加密备份 | 扫码导入 2FA |
 | --- | --- |
@@ -44,6 +44,7 @@
 | 扫码导入 2FA | 摄像头实时扫码（jsQR 本地解码）或从相册选图识别，图像不出设备 |
 | 自动加密备份 | 每次修改自动留一份密文快照，保留最近 8 份，可一键回滚 |
 | 设备自动发现 | 像 LocalSend 一样列出局域网内所有运行本软件的设备，扫码或点选即可配对 |
+| 生物识别解锁 | 指纹 / 面容 / Windows Hello 解锁，无需输入主密码（安卓走系统 BiometricPrompt，电脑走 WebAuthn） |
 | 加密备份导入 | 从 `.json` 备份恢复，可选「合并」或「覆盖」 |
 | 桌面安装包 | Electron 打包 `Setup.exe` / 免安装版 |
 | 安卓安装包 | Capacitor 打包 `apk`，原生窗口 + 系统分享导出 |
@@ -150,6 +151,15 @@
 - 实时显示强度与熵值（比特）。
 - 在编辑条目时点密码框右侧的 🎲，生成后可直接填入。
 
+### 生物识别解锁
+
+在「设置 → 生物识别解锁」点「启用」，验证一次指纹 / 面容即可。之后锁屏界面会出现「使用指纹 / 面容解锁」按钮。
+
+- **安卓 App**：走系统 `BiometricPrompt`，密钥存在 Android Keystore 里（`setUserAuthenticationRequired`），没有指纹/面容无法取出。
+- **电脑（Electron / Chrome / Edge）**：走 WebAuthn PRF，用 Windows Hello / Touch ID 派生的密钥包裹保险库主密钥。
+- 保险库主密钥被包裹后存在本机 `localStorage`，**没有生物特征就无法解开**；修改主密码、恢复备份或配对覆盖后会自动失效，需要重新启用。
+- 浏览器地址必须是**域名**（`localhost` 可以），WebAuthn 不支持 `192.168.x.x` 这类 IP 源；安卓 App 不受此限制。
+
 ### 备份与恢复
 
 - **自动加密备份**：每次修改后自动留一份密文快照，本机保留最近 8 份（上限 2 MB）。在「设置 → 自动加密备份」里可以查看、恢复、删除，或手动补一份快照。误删条目、误覆盖后点「恢复」即可回滚，恢复时可选合并或覆盖。
@@ -185,6 +195,7 @@
 | 完整性 | 版本号、更新时间、设备 ID 作为 AAD 参与认证，篡改即解密失败 |
 | 存储 | 浏览器 IndexedDB/localStorage 中只存密文；服务端只存密文 |
 | 传输 | 局域网 HTTP / HTTPS，6 位配对码鉴权（5 次失败锁定 30 秒）+ 主密码解密 |
+| 生物识别 | 主密钥用生物特征派生的密钥包裹（WebAuthn PRF / Android Keystore），明文密钥不落盘 |
 | 2FA | RFC 6238 TOTP / RFC 4226 HOTP，密钥只存在加密保险库内 |
 | 随机数 | `crypto.getRandomValues`（CSPRNG），生成器使用拒绝采样避免模偏差 |
 
@@ -376,6 +387,9 @@ A：当前版本通过「粘贴 otpauth:// 链接 / Base32 密钥」或文件导
 
 **Q：换网络后手机提示证书错误 / 打不开？**
 A：IP 变了导致证书里的地址不匹配。删除 `data/cert.pem` 与 `data/key.pem`（或运行 `bash scripts/reset-cert.sh`），重启服务会按新 IP 重新生成。
+
+**Q：为什么手机浏览器里没有「生物识别解锁」？**
+A：WebAuthn 要求页面来源是域名，`https://192.168.x.x:8443` 是 IP 源，浏览器会拒绝。用安卓 App（原生 BiometricPrompt）或在电脑上用 `localhost` 访问即可。
 
 **Q：能不能自动填充网页密码？**
 A：当前版本不含浏览器扩展/自动填充，定位是「本地保险库 + 手动复制」。需要自动填充可以配合 KeePassXC 浏览器插件使用同一份导出数据。

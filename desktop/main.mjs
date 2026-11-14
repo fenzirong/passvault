@@ -187,7 +187,7 @@ if (!app.requestSingleInstanceLock()) {
     try {
       server = await startServer();
       buildMenu();
-      createWindow(`http://127.0.0.1:${server.httpPort}/`);
+      createWindow(`http://localhost:${server.httpPort}/`);
     } catch (err) {
       startError = err;
       dialog.showErrorBox('启动失败', `无法启动本地服务：${err.message}`);
@@ -196,7 +196,7 @@ if (!app.requestSingleInstanceLock()) {
 
     app.on('activate', () => {
       if (BrowserWindow.getAllWindows().length === 0 && server) {
-        createWindow(`http://127.0.0.1:${server.httpPort}/`);
+        createWindow(`http://localhost:${server.httpPort}/`);
       }
     });
   });
