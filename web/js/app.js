@@ -62,6 +62,14 @@ import {
 } from './sync.js';
 import { openQrScanner } from './qrscan.js';
 import {
+  available as nativeServerAvailable,
+  start as nativeServerStart,
+  updateVault as nativeServerUpdate,
+  getVault as nativeServerGetVault,
+  status as nativeServerStatus,
+  onVaultUpdated as nativeOnVaultUpdated,
+} from './native-server.js';
+import {
   isSupported as bioSupported,
   enroll as bioEnroll,
   unlock as bioUnlock,
@@ -123,6 +131,7 @@ const state = {
   sync: { devices: [], activeId: null, lastSyncAt: null },
   pendingPairCode: null,
   isServerHost: false,
+  nativeServer: false,
   ui: { theme: 'dark' },
   deviceId: '',
   saveTimer: null,
@@ -141,6 +150,9 @@ function init() {
     showInsecureNotice();
     return;
   }
+  nativeOnVaultUpdated((data) => {
+    if (data?.envelope) applyNativePush(data.envelope).catch(() => {});
+  });
   const isLocalHost = ['127.0.0.1', 'localhost', '::1', '[::1]'].includes(location.hostname);
   if (isLocalHost) {
     fetchPairingInfo()
@@ -441,7 +453,10 @@ function enterApp() {
   render();
   startTotpTicker();
   resetIdle();
-  startShadowHeartbeat();
+  startNativeServer().then(() => {
+    pullFromNativeServer();
+    if (!state.nativeServer) startShadowHeartbeat();
+  });
 }
 
 function lockVault(silent = false) {
@@ -483,6 +498,7 @@ async function persist() {
   state.envelope = env;
   localStorage.setItem(LS.vault, JSON.stringify(env));
   recordSnapshot(env);
+  if (state.nativeServer) nativeServerUpdate(env);
   if (state.isServerHost) syncWithSelfServer();
 }
 
@@ -1377,7 +1393,7 @@ function openSettings(tab = 'general') {
 
     <div class="section-title">关于</div>
     <p class="hint" style="margin:0">
-      密码保险库 v1.4.0 · 本地加密，零依赖。<br>
+      密码保险库 v1.5.0 · 本地加密，零依赖。<br>
       加密：PBKDF2-SHA256（${KDF_ITERATIONS.toLocaleString()} 次）+ AES-256-GCM；2FA：RFC 6238 TOTP。<br>
       参考开源项目：KeePassXC、KeePassDX、Bitwarden、Aegis Authenticator；二维码解码使用 jsQR（Apache-2.0）。
     </p>
@@ -2165,6 +2181,20 @@ function openSyncPanel() {
           location.hostname === '::1' ||
           location.hostname === '[::1]';
         if (!isLocal) {
+          // 安卓：后台服务运行中时显示本机配对码
+          if (state.nativeServer) {
+            const st = await nativeServerStatus();
+            if (st?.running) {
+              selfEl.innerHTML = `<div class="pair-card">
+                <div class="pair-info">
+                  <div class="pair-label">本机配对码（手机）</div>
+                  <div class="pair-code">${escapeHtml(st.code || phonePairCode())}</div>
+                  <div class="pair-addr">端口 ${st.port} · 后台服务运行中，锁屏也能被访问</div>
+                </div>
+              </div>`;
+              return;
+            }
+          }
           selfEl.innerHTML = '';
           return;
         }
@@ -2444,6 +2474,87 @@ function syncWithSelfServer() {
 
 let shadowTimer = null;
 let shadowBusy = false;
+
+function phonePairCode() {
+  let code = localStorage.getItem('pm.pairCode');
+  if (!/^\d{6}$/.test(code || '')) {
+    code = String(Math.floor(Math.random() * 1_000_000)).padStart(6, '0');
+    localStorage.setItem('pm.pairCode', code);
+  }
+  return code;
+}
+
+/** 安卓：启动后台服务，让手机在后台也能被访问 */
+async function startNativeServer() {
+  if (!nativeServerAvailable()) return;
+  try {
+    const res = await nativeServerStart({
+      code: phonePairCode(),
+      deviceId: state.deviceId,
+      name: deviceDisplayName(),
+    });
+    state.nativeServer = Boolean(res?.running);
+    if (state.nativeServer && state.envelope) await nativeServerUpdate(state.envelope);
+  } catch {
+    state.nativeServer = false;
+  }
+}
+
+/** 锁屏期间收到的推送：解锁后从本机服务取回并合并 */
+async function pullFromNativeServer() {
+  if (!state.nativeServer) return;
+  try {
+    const data = await nativeServerGetVault();
+    const envelope = data?.envelope;
+    if (!envelope) return;
+    const rev = Number(envelope.header?.revision || 0);
+    if (rev <= state.header.revision) return;
+    const remoteVault = await decryptWithKey(envelope, state.key);
+    const { vault } = mergeVaults(state.vault, remoteVault);
+    state.vault = vault;
+    const header = { revision: rev, updatedAt: nowISO(), deviceId: state.deviceId };
+    const env = await sealVault(state.vault, state.key, {
+      salt: state.salt,
+      iterations: state.iterations,
+      header,
+    });
+    state.header = header;
+    state.envelope = env;
+    state.dirty = false;
+    localStorage.setItem(LS.vault, JSON.stringify(env));
+    await nativeServerUpdate(env);
+    render();
+  } catch {
+    /* 忽略 */
+  }
+}
+
+/** 其他设备推送到本机服务时触发 */
+async function applyNativePush(envelope) {
+  if (!state.unlocked || !envelope) return;
+  const rev = Number(envelope.header?.revision || 0);
+  if (!rev || rev <= state.header.revision) return;
+  try {
+    const remoteVault = await decryptWithKey(envelope, state.key);
+    const { vault } = mergeVaults(state.vault, remoteVault);
+    state.vault = vault;
+    const header = { revision: rev, updatedAt: nowISO(), deviceId: state.deviceId };
+    const env = await sealVault(state.vault, state.key, {
+      salt: state.salt,
+      iterations: state.iterations,
+      header,
+    });
+    state.header = header;
+    state.envelope = env;
+    state.dirty = false;
+    localStorage.setItem(LS.vault, JSON.stringify(env));
+    await nativeServerUpdate(env);
+    render();
+    toast('已接收其他设备推送的更新', 'ok');
+  } catch {
+    /* 忽略 */
+  }
+}
 
 function deviceDisplayName() {
   const ua = navigator.userAgent || '';
