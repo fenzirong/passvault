@@ -10,6 +10,7 @@ import com.getcapacitor.PluginCall;
 import com.getcapacitor.PluginMethod;
 import com.getcapacitor.annotation.CapacitorPlugin;
 
+import org.json.JSONArray;
 import org.json.JSONObject;
 
 /** 控制后台同步服务：启动 / 停止 / 更新保险库 / 查询状态 */
@@ -89,6 +90,16 @@ public class PassVaultServerPlugin extends Plugin {
             ret.put("revision", 0);
             ret.put("envelope", null);
         }
+        call.resolve(ret);
+    }
+
+    @PluginMethod
+    public void peers(PluginCall call) {
+        JSObject ret = new JSObject();
+        JSONArray list = PassVaultService.discovery != null
+            ? PassVaultService.discovery.list()
+            : new JSONArray();
+        ret.put("peers", list);
         call.resolve(ret);
     }
 

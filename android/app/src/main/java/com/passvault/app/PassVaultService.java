@@ -25,6 +25,7 @@ public class PassVaultService extends Service {
     public static VaultStore store;
     public static VaultHttpServer server;
     public static UdpAnnouncer announcer;
+    public static UdpDiscovery discovery;
     public static int port = 0;
     public static String pairingCode = "";
     public static String deviceId = "";
@@ -74,6 +75,8 @@ public class PassVaultService extends Service {
                 port = server.getPort();
                 announcer = new UdpAnnouncer(deviceId, deviceName, port);
                 announcer.start();
+                discovery = new UdpDiscovery(this, deviceId);
+                discovery.start();
             } catch (Exception e) {
                 port = 0;
             }
@@ -86,6 +89,10 @@ public class PassVaultService extends Service {
         if (announcer != null) {
             announcer.stop();
             announcer = null;
+        }
+        if (discovery != null) {
+            discovery.stop();
+            discovery = null;
         }
         if (server != null) {
             server.stop();

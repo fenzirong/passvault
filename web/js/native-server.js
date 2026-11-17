@@ -49,6 +49,17 @@ export async function getVault() {
   }
 }
 
+export async function peers() {
+  const p = plugin();
+  if (!p) return null;
+  try {
+    const res = await p.peers();
+    return Array.isArray(res?.peers) ? res.peers : [];
+  } catch {
+    return null;
+  }
+}
+
 export async function status() {
   const p = plugin();
   if (!p) return null;

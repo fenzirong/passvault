@@ -67,6 +67,7 @@ import {
   updateVault as nativeServerUpdate,
   getVault as nativeServerGetVault,
   status as nativeServerStatus,
+  peers as nativePeers,
   onVaultUpdated as nativeOnVaultUpdated,
 } from './native-server.js';
 import {
@@ -1393,7 +1394,7 @@ function openSettings(tab = 'general') {
 
     <div class="section-title">关于</div>
     <p class="hint" style="margin:0">
-      密码保险库 v1.5.0 · 本地加密，零依赖。<br>
+      密码保险库 v1.5.1 · 本地加密，零依赖。<br>
       加密：PBKDF2-SHA256（${KDF_ITERATIONS.toLocaleString()} 次）+ AES-256-GCM；2FA：RFC 6238 TOTP。<br>
       参考开源项目：KeePassXC、KeePassDX、Bitwarden、Aegis Authenticator；二维码解码使用 jsQR（Apache-2.0）。
     </p>
@@ -1990,8 +1991,15 @@ function originDevice() {
 }
 
 /** 手机通过 HTTPS 打开页面时，跨设备请求需要由「提供页面的设备」中继 */
+function isNativeApp() {
+  return Boolean(globalThis.Capacitor?.isNativePlatform?.());
+}
+
 function needsRelay(url) {
-  return location.protocol === 'https:' && !sameOrigin(url, location.origin);
+  if (location.protocol !== 'https:') return false;
+  if (sameOrigin(url, location.origin)) return false;
+  // 只有「页面由某台已配对设备提供」时才能中继；App 内页面来自本地，直接连对方
+  return Boolean(originDevice());
 }
 
 function makeClient(device, code) {
@@ -2120,9 +2128,16 @@ function openSyncPanel() {
 
       const renderNearby = async () => {
         try {
-          const data = await fetchDiscovery();
+          let data = null;
+          if (isNativeApp()) {
+            const nativeList = await nativePeers();
+            if (nativeList) {
+              data = { self: null, peers: nativeList.map((p) => ({ ...p, shadow: false })) };
+            }
+          }
+          if (!data) data = await fetchDiscovery();
           const rows = [];
-          const useHttps = location.protocol === 'https:';
+          const useHttps = location.protocol === 'https:' && !isNativeApp();
           const isLocalPage =
             location.hostname === '127.0.0.1' ||
             location.hostname === 'localhost' ||
