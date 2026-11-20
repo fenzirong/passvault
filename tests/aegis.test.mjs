@@ -20,10 +20,13 @@ import {
   toAegisUuid,
 } from '../web/js/aegis.js';
 import { normalizeTotp, steam, totp } from '../web/js/totp.js';
+import { deriveKey, exportRawKey, openVaultWithSecret, sealVault } from '../web/js/crypto.js';
+import { enc, randomBytes } from '../web/js/util.js';
 import {
   createGroup,
   deleteGroup,
   ensureGroups,
+  entryKey,
   groupNameMap,
   mergeGroups,
   mergeVaults,
@@ -155,7 +158,9 @@ test('明文 Aegis 备份：识别、解析条目与分组、跳过不支持的�
   assert.equal(groups[0].name, '工作');
 
   const gh = entries.find((e) => e.title === 'GitHub');
-  assert.equal(gh.username, 'me@example.com');
+  // 与「自己新建的 2FA 条目」同形状：账号只放在 totp.account，不占 username
+  assert.equal(gh.username, '');
+  assert.equal(gh.totp.account, 'me@example.com');
   assert.equal(gh.notes, '工作账号');
   assert.equal(gh.favorite, true);
   assert.equal(gh.totp.secret, 'JBSWY3DPEHPK3PXP');
@@ -388,4 +393,64 @@ test('normalizeEntry 保留并去重 groups', () => {
   const e = normalizeEntry({ title: 'x', groups: ['a', 'a', ' b ', ''] });
   assert.deepEqual(e.groups, ['a', 'b']);
   assert.deepEqual(normalizeEntry({ title: 'y' }).groups, []);
+});
+
+test('entryKey 区分同一发行方下的不同账号（避免导入时误判重复）', () => {
+  const a = normalizeEntry({ title: 'GitHub', totp: { secret: 'JBSWY3DPEHPK3PXP', account: 'a@x.com' } });
+  const b = normalizeEntry({ title: 'GitHub', totp: { secret: 'JBSWY3DPEHPK3PXP', account: 'b@x.com' } });
+  assert.notEqual(entryKey(a), entryKey(b));
+  assert.equal(entryKey(a), entryKey(normalizeEntry({ ...a })));
+});
+
+/* ============================== 生物识别密钥解析 ============================== */
+
+test('生物识别包裹主密码：同步换了 salt 之后依然能解锁', async () => {
+  const vault = { schema: 1, entries: [], groups: [] };
+  const saltA = randomBytes(16);
+  const saltB = randomBytes(16);
+  const envA = await sealVault(vault, await deriveKey('master-pw', saltA, 100_000), {
+    salt: saltA,
+    iterations: 100_000,
+    header: { revision: 1, updatedAt: new Date().toISOString(), deviceId: 'd1' },
+  });
+  // 同步：换成另一台设备的 salt / iterations（派生密钥完全不同）
+  const envB = await sealVault(vault, await deriveKey('master-pw', saltB, 100_000), {
+    salt: saltB,
+    iterations: 100_000,
+    header: { revision: 2, updatedAt: new Date().toISOString(), deviceId: 'd2' },
+  });
+
+  const secret = enc.encode('master-pw');
+  const openedA = await openVaultWithSecret(envA, secret);
+  assert.equal(openedA.vault.schema, 1);
+  const openedB = await openVaultWithSecret(envB, secret);
+  assert.equal(openedB.vault.schema, 1, '同步后仍然能解开');
+  assert.equal(openedB.legacy, undefined);
+});
+
+test('兼容旧记录：包裹的是原始密钥时走 legacy 分支', async () => {
+  const salt = randomBytes(16);
+  const key = await deriveKey('master-pw', salt, 100_000);
+  const env = await sealVault({ schema: 1, entries: [], groups: [] }, key, {
+    salt,
+    iterations: 100_000,
+    header: { revision: 1, updatedAt: new Date().toISOString(), deviceId: 'd1' },
+  });
+  const raw = await exportRawKey(key);
+  const opened = await openVaultWithSecret(env, raw);
+  assert.equal(opened.legacy, true);
+  assert.equal(opened.vault.schema, 1);
+});
+
+test('主密码变过时给出 BIO_STALE 而不是静默失败', async () => {
+  const salt = randomBytes(16);
+  const env = await sealVault({ schema: 1, entries: [], groups: [] }, await deriveKey('new-pw', salt, 100_000), {
+    salt,
+    iterations: 100_000,
+    header: { revision: 1, updatedAt: new Date().toISOString(), deviceId: 'd1' },
+  });
+  await assert.rejects(
+    () => openVaultWithSecret(env, enc.encode('old-pw')),
+    (err) => err.code === 'BIO_STALE',
+  );
 });

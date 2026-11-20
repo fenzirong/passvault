@@ -139,6 +139,15 @@ export function touchEntry(entry) {
   return entry;
 }
 
+/**
+ * 导入去重用的键。
+ * 必须带上 2FA 账号：同一个发行方下的多个账号（如两个 GitHub）标题相同、
+ * 用户名都为空，只用 title|username 会把第二个当成重复丢掉。
+ */
+export function entryKey(entry) {
+  return [entry?.title || '', entry?.username || '', entry?.totp?.account || ''].join('|');
+}
+
 /** 软删除（保留墓碑，便于多设备合并） */
 export function deleteEntry(vault, id) {
   const e = vault.entries.find((x) => x.id === id);

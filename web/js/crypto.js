@@ -103,6 +103,52 @@ export async function importRawKey(raw) {
   return subtle.importKey('raw', raw, { name: 'AES-GCM' }, true, ['encrypt', 'decrypt']);
 }
 
+/**
+ * 用生物识别取回的「秘密」打开保险库。
+ *
+ * 1.5.4 起生物识别包裹的是**主密码**而不是派生密钥：同步会把保险库换成对方的
+ * salt / iterations，派生密钥随之改变，旧做法（包裹密钥）在同步后必然解不开。
+ * 主密码不会因为同步而改变，所以包裹主密码才能跨同步继续用。
+ *
+ * 为了兼容 1.5.3 及更早的记录（包裹的是原始密钥），这里先按主密码试，
+ * 失败再按原始密钥试。
+ *
+ * @param {object} envelope
+ * @param {Uint8Array} secret 生物识别取回的字节
+ */
+export async function openVaultWithSecret(envelope, secret) {
+  assertEnvelope(envelope);
+  let passwordError = null;
+  try {
+    const password = dec.decode(secret);
+    if (password) return await openVault(envelope, password);
+  } catch (err) {
+    passwordError = err;
+  }
+  // 旧记录：secret 是 32 字节原始密钥
+  if (secret && secret.length === 32) {
+    try {
+      const key = await importRawKey(secret);
+      const vault = await decryptWithKey(envelope, key);
+      return {
+        vault,
+        key,
+        salt: b64decode(envelope.kdf.salt),
+        iterations: Number(envelope.kdf.iterations) || KDF_ITERATIONS,
+        header: envelope.header,
+        legacy: true,
+      };
+    } catch {
+      /* 落到下面统一报错 */
+    }
+  }
+  const err = new Error(
+    '生物识别记录已失效（保险库密钥或主密码变过），请用主密码解锁后重新启用生物识别',
+  );
+  err.code = passwordError?.code === 'BAD_PASSWORD' ? 'BIO_STALE' : 'BIO_FAILED';
+  throw err;
+}
+
 /** 用已有密钥直接解密（同步时无需再次输入主密码） */
 export async function decryptWithKey(envelope, key) {
   assertEnvelope(envelope);

@@ -10,6 +10,7 @@ import {
   nowISO,
   uuid,
   clamp,
+  enc,
 } from './util.js';
 import {
   createEmptyVault,
@@ -21,10 +22,12 @@ import {
   deriveKey,
   exportRawKey,
   importRawKey,
+  openVaultWithSecret,
   KDF_ITERATIONS,
 } from './crypto.js';
 import {
   totp,
+  hotp,
   totpRemaining,
   totpProgress,
   parseOtpauthUri,
@@ -51,6 +54,7 @@ import {
   parseCsvImport,
   parseJsonImport,
   purgeTombstones,
+  entryKey,
   ensureGroups,
   createGroup,
   renameGroup,
@@ -282,6 +286,15 @@ function readLocalEnvelope() {
 
 function registerServiceWorker() {
   if (!('serviceWorker' in navigator) || !window.isSecureContext) return;
+  // 新版本接管后自动刷新一次：桌面端窗口长期不关，不刷新就会一直跑旧界面
+  // （表现为「电脑端没有分组」这类升级后功能缺失）。
+  const hadController = Boolean(navigator.serviceWorker.controller);
+  let reloading = false;
+  navigator.serviceWorker.addEventListener('controllerchange', () => {
+    if (!hadController || reloading) return;
+    reloading = true;
+    location.reload();
+  });
   navigator.serviceWorker.register('sw.js').catch(() => {});
 }
 
@@ -433,22 +446,34 @@ async function unlockWithBiometric() {
   btn.textContent = '验证中…';
   lockError('');
   try {
-    const raw = await bioUnlock();
-    const key = await importRawKey(raw);
+    const secret = await bioUnlock();
     const env = state.envelope || readLocalEnvelope();
     if (!env) throw new Error('本机没有找到保险库');
-    const vault = await decryptWithKey(env, key);
-    state.key = key;
-    state.salt = b64decode(env.kdf.salt);
-    state.iterations = Number(env.kdf.iterations) || KDF_ITERATIONS;
+    // 新记录包裹的是主密码（同步后依然有效），旧记录包裹的是派生密钥
+    const opened = await openVaultWithSecret(env, secret);
+    state.key = opened.key;
+    state.salt = opened.salt;
+    state.iterations = opened.iterations;
     state.masterPassword = null;
-    state.vault = vault;
+    state.vault = opened.vault;
     state.header = env.header;
     state.envelope = env;
     state.dirty = false;
+    if (opened.legacy) {
+      // 旧记录：顺手升级成「包裹主密码」，下次同步就不会再失效
+      toast('生物识别记录已升级，建议在设置里重新启用一次以支持同步', 'warn', 5000);
+    }
     enterApp();
   } catch (err) {
-    lockError(err.message || '生物识别解锁失败');
+    if (err.code === 'BIO_STALE' || err.code === 'BIO_FAILED') {
+      // 记录已经用不了，清掉避免一直显示一个按不动的按钮
+      bioClear();
+      lockError(err.message);
+      const bioBtn = $('#bio-unlock');
+      if (bioBtn) bioBtn.hidden = true;
+    } else {
+      lockError(err.message || '生物识别解锁失败');
+    }
   } finally {
     btn.disabled = false;
     btn.textContent = '使用指纹 / 面容解锁';
@@ -613,7 +638,7 @@ function renderList() {
   }
   el.innerHTML = list
     .map((e) => {
-      const sub = e.type === 'note' ? '安全笔记' : e.username || hostOf(e.url) || '—';
+      const sub = e.type === 'note' ? '安全笔记' : e.username || e.totp?.account || hostOf(e.url) || '—';
       const names = groupNameMap(state.vault);
       const groupBadge = (e.groups || [])
         .map((g) => names[g])
@@ -736,7 +761,7 @@ function renderDetail() {
     <div class="meta-line">
       <span>创建于 ${formatDateTime(entry.createdAt)}</span>
       <span>更新于 ${relativeTime(entry.updatedAt)}</span>
-      ${entry.totp ? `<span>2FA：${escapeHtml(entry.totp.algorithm)} · ${entry.totp.digits} 位 · ${entry.totp.period}s</span>` : ''}
+      ${entry.totp ? `<span>2FA：${escapeHtml(totpTypeLabel(entry.totp))} · ${escapeHtml(entry.totp.algorithm)} · ${entry.totp.digits} 位${entry.totp.type === 'hotp' ? ` · 计数器 ${Number(entry.totp.counter) || 0}` : ` · ${entry.totp.period}s`}</span>` : ''}
     </div>
   `;
   updateTotpWidgets();
@@ -778,15 +803,19 @@ async function updateTotpWidgets() {
     for (const node of nodes) {
       const entry = state.vault.entries.find((e) => e.id === node.dataset.totpId);
       if (!entry?.totp) continue;
+      const isHotp = entry.totp.type === 'hotp';
       const period = entry.totp.period || 30;
-      const left = totpRemaining(period);
-      const progress = totpProgress(period);
+      const left = isHotp ? 0 : totpRemaining(period);
+      const progress = isHotp ? 1 : totpProgress(period);
       try {
-        const code = await totp({ ...entry.totp });
+        // HOTP 用计数器算，不能按时间算（否则和 Aegis 显示的码不一样）
+        const code = isHotp
+          ? await hotp({ ...entry.totp, counter: Number(entry.totp.counter) || 0 })
+          : await totp({ ...entry.totp });
         const codeEl = node.querySelector('.totp-code');
         if (codeEl) {
           codeEl.textContent = formatCode(code);
-          codeEl.classList.toggle('expiring', left <= 5);
+          codeEl.classList.toggle('expiring', !isHotp && left <= 5);
         }
         node.dataset.code = code;
       } catch {
@@ -794,11 +823,15 @@ async function updateTotpWidgets() {
         if (codeEl) codeEl.textContent = '密钥无效';
       }
       const leftEl = node.querySelector('.totp-left');
-      if (leftEl) leftEl.textContent = String(left);
+      if (leftEl) {
+        leftEl.textContent = isHotp ? String(Number(entry.totp.counter) || 0) : String(left);
+      }
+      const metaEl = node.querySelector('.totp-meta');
+      if (metaEl && isHotp) metaEl.firstChild.textContent = '计数器 ';
       const ring = node.querySelector('.ring');
       if (ring) {
         ring.style.setProperty('--p', String(progress));
-        ring.classList.toggle('warn', left <= 5);
+        ring.classList.toggle('warn', !isHotp && left <= 5);
       }
     }
   } finally {
@@ -811,6 +844,14 @@ function formatCode(code) {
   if (s.length === 6) return `${s.slice(0, 3)} ${s.slice(3)}`;
   if (s.length === 8) return `${s.slice(0, 4)} ${s.slice(4)}`;
   return s;
+}
+
+/** 2FA 类型的中文标签 */
+function totpTypeLabel(totpData) {
+  if (!totpData) return '';
+  if (totpData.type === 'hotp') return 'HOTP';
+  if (totpData.type === 'steam') return 'Steam';
+  return 'TOTP';
 }
 
 /* ============================== 剪贴板 / 提示 ============================== */
@@ -1163,7 +1204,14 @@ function openEditor(entry = null) {
             <input id="f-account" type="text" value="${escapeHtml(e.totp?.account || '')}" placeholder="me@example.com">
           </label>
         </div>
-        <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:10px">
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px">
+          <label class="field"><span class="field-label">类型</span>
+            <select id="f-totp-type">
+              <option value="totp" ${(e.totp?.type || 'totp') === 'totp' ? 'selected' : ''}>TOTP（按时间）</option>
+              <option value="hotp" ${e.totp?.type === 'hotp' ? 'selected' : ''}>HOTP（按计数器）</option>
+              <option value="steam" ${e.totp?.type === 'steam' ? 'selected' : ''}>Steam 令牌</option>
+            </select>
+          </label>
           <label class="field"><span class="field-label">算法</span>
             <select id="f-algo">
               ${['SHA1', 'SHA256', 'SHA512']
@@ -1171,14 +1219,23 @@ function openEditor(entry = null) {
                 .join('')}
             </select>
           </label>
+        </div>
+        <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:10px">
           <label class="field"><span class="field-label">位数</span>
             <select id="f-digits">
-              <option value="6" ${e.totp?.digits !== 8 ? 'selected' : ''}>6 位</option>
-              <option value="8" ${e.totp?.digits === 8 ? 'selected' : ''}>8 位</option>
+              ${[5, 6, 7, 8]
+                .map(
+                  (d) =>
+                    `<option value="${d}" ${Number(e.totp?.digits || 6) === d ? 'selected' : ''}>${d} 位</option>`,
+                )
+                .join('')}
             </select>
           </label>
-          <label class="field"><span class="field-label">周期（秒）</span>
+          <label class="field" id="f-period-wrap"><span class="field-label">周期（秒）</span>
             <input id="f-period" type="number" min="10" max="120" value="${e.totp?.period || 30}">
+          </label>
+          <label class="field" id="f-counter-wrap" ${e.totp?.type === 'hotp' ? '' : 'hidden'}><span class="field-label">计数器</span>
+            <input id="f-counter" type="number" min="0" value="${Number(e.totp?.counter) || 0}">
           </label>
         </div>
       </div>
@@ -1276,6 +1333,43 @@ function openEditor(entry = null) {
       const totpInput = root.querySelector('#f-totp');
       const extra = root.querySelector('#f-totp-extra');
       const hint = root.querySelector('#f-totp-hint');
+      const typeEl = root.querySelector('#f-totp-type');
+      const algoEl = root.querySelector('#f-algo');
+      const digitsEl = root.querySelector('#f-digits');
+      const periodEl = root.querySelector('#f-period');
+      const counterEl = root.querySelector('#f-counter');
+      const periodWrap = root.querySelector('#f-period-wrap');
+      const counterWrap = root.querySelector('#f-counter-wrap');
+
+      /** 类型切换时联动：HOTP 用计数器、Steam 固定 5 位 SHA1 */
+      const syncTypeUi = () => {
+        const t = typeEl.value;
+        periodWrap.hidden = t === 'hotp';
+        counterWrap.hidden = t !== 'hotp';
+        algoEl.disabled = t === 'steam';
+        digitsEl.disabled = t === 'steam';
+        if (t === 'steam') {
+          algoEl.value = 'SHA1';
+          digitsEl.value = '5';
+        }
+      };
+
+      const readTotpForm = () => ({
+        type: typeEl.value,
+        algorithm: algoEl.value,
+        digits: Number(digitsEl.value),
+        period: Number(periodEl.value) || 30,
+        counter: Number(counterEl.value) || 0,
+      });
+
+      const applyTotpForm = (data) => {
+        typeEl.value = data.type || 'totp';
+        algoEl.value = data.algorithm || 'SHA1';
+        digitsEl.value = String(data.digits || 6);
+        periodEl.value = String(data.period || 30);
+        counterEl.value = String(data.counter || 0);
+        syncTypeUi();
+      };
 
       const parseTotpInput = () => {
         const raw = totpInput.value.trim();
@@ -1293,18 +1387,14 @@ function openEditor(entry = null) {
             totpInput.value = parsed.secret;
             root.querySelector('#f-issuer').value = parsed.issuer || '';
             root.querySelector('#f-account').value = parsed.account || '';
-            root.querySelector('#f-algo').value = parsed.algorithm;
-            root.querySelector('#f-digits').value = String(parsed.digits);
-            root.querySelector('#f-period').value = String(parsed.period);
-            hint.textContent = `已识别：${parsed.issuer || '未命名'} · ${parsed.algorithm} · ${parsed.digits} 位`;
+            applyTotpForm(parsed);
+            hint.textContent = `已识别：${parsed.issuer || '未命名'} · ${parsed.type.toUpperCase()} · ${parsed.algorithm} · ${parsed.digits} 位`;
           } else {
             totpData = normalizeTotp({
               secret: raw,
               issuer: root.querySelector('#f-issuer').value,
               account: root.querySelector('#f-account').value,
-              algorithm: root.querySelector('#f-algo').value,
-              digits: Number(root.querySelector('#f-digits').value),
-              period: Number(root.querySelector('#f-period').value),
+              ...readTotpForm(),
             });
             hint.textContent = '已识别为 Base32 密钥';
           }
@@ -1340,16 +1430,15 @@ function openEditor(entry = null) {
           },
         });
       };
-      ['#f-issuer', '#f-account', '#f-algo', '#f-digits', '#f-period'].forEach((sel) => {
+      ['#f-issuer', '#f-account', '#f-algo', '#f-digits', '#f-period', '#f-counter', '#f-totp-type'].forEach((sel) => {
         root.querySelector(sel).addEventListener('change', () => {
+          if (sel === '#f-totp-type') syncTypeUi();
           if (!totpData) return;
           totpData = normalizeTotp({
             ...totpData,
             issuer: root.querySelector('#f-issuer').value,
             account: root.querySelector('#f-account').value,
-            algorithm: root.querySelector('#f-algo').value,
-            digits: Number(root.querySelector('#f-digits').value),
-            period: Number(root.querySelector('#f-period').value),
+            ...readTotpForm(),
           });
         });
       });
@@ -1386,6 +1475,9 @@ function openEditor(entry = null) {
           toast('2FA 密钥无法识别，请检查格式', 'err');
           return;
         }
+        // 保存前把表单里的类型/算法/位数/周期/计数器全部带上，
+        // 否则导入的 HOTP / Steam 条目一编辑就会被改回普通 TOTP
+        if (totpData) totpData = normalizeTotp({ ...totpData, ...readTotpForm() });
 
         const payload = {
           ...e,
@@ -1665,7 +1757,7 @@ function openSettings(tab = 'general') {
 
     <div class="section-title">关于</div>
     <p class="hint" style="margin:0">
-      密码保险库 v1.5.3 · 本地加密，零依赖。<br>
+      密码保险库 v1.5.4 · 本地加密，零依赖。<br>
       加密：PBKDF2-SHA256（${KDF_ITERATIONS.toLocaleString()} 次）+ AES-256-GCM；2FA：RFC 6238 TOTP。<br>
       参考开源项目：KeePassXC、KeePassDX、Bitwarden、Aegis Authenticator；二维码解码使用 jsQR（Apache-2.0）。
     </p>
@@ -1701,8 +1793,18 @@ function openSettings(tab = 'general') {
             toast('当前设备不支持生物识别（或未录入指纹 / 面容）', 'warn', 4000);
             return;
           }
-          const raw = await exportRawKey(state.key);
-          await bioEnroll(raw);
+          // 包裹「主密码」而不是派生密钥：同步会把保险库换成对方的 salt /
+          // iterations，派生密钥随之改变，包裹密钥的话同步后必然解不开。
+          let password = state.masterPassword;
+          if (!password) {
+            password = await promptPassword({
+              title: '启用生物识别',
+              message: '需要主密码来生成生物识别凭据（只会在本机加密保存，不会上传）。',
+              okText: '继续',
+            });
+            if (!password) return;
+          }
+          await bioEnroll(enc.encode(password));
           toast('已启用生物识别解锁', 'ok');
           close();
           openSettings();
@@ -1968,7 +2070,7 @@ function openImport() {
             } else if (data.entries?.[0]?.info || (Array.isArray(data) && data[0]?.secret)) {
               const list = parseAnyTotp(trimmed);
               showPreview(
-                list.map((t) => normalizeEntry({ title: t.issuer || t.account || '2FA', username: t.account, totp: t })),
+                list.map((t) => normalizeEntry({ title: t.issuer || t.account || '2FA', username: '', totp: t })),
                 'andOTP / 2FA JSON',
               );
             } else {
@@ -1983,7 +2085,7 @@ function openImport() {
           }
           const list = parseAnyTotp(trimmed);
           showPreview(
-            list.map((t) => normalizeEntry({ title: t.issuer || t.account || '2FA', username: t.account, totp: t })),
+            list.map((t) => normalizeEntry({ title: t.issuer || t.account || '2FA', username: '', totp: t })),
             '2FA 密钥',
           );
         } catch (err) {
@@ -2021,12 +2123,12 @@ function openImport() {
         // 分组先并入保险库，再把条目上的分组 id 换成最终 id
         const groupMap = mergeGroups(state.vault, parsed.groups || []);
         const existing = new Set(
-          state.vault.entries.filter((e) => !e.deletedAt).map((e) => `${e.title}|${e.username}`),
+          state.vault.entries.filter((e) => !e.deletedAt).map((e) => entryKey(e)),
         );
         let added = 0;
         let skipped = 0;
         for (const item of entries) {
-          const key = `${item.title}|${item.username}`;
+          const key = entryKey(item);
           if (existing.has(key)) {
             skipped++;
             continue;
@@ -2377,8 +2479,16 @@ function makeClient(device, code) {
   const relay = needsRelay(device.url)
     ? { baseUrl: location.origin, code: originDevice()?.code || '' }
     : null;
-  // 中继由服务端发起，走对方的 HTTP 端口即可，避免自签名证书问题
-  const baseUrl = relay ? device.httpUrl || device.url : device.url;
+  // 中继由服务端发起，走对方的 HTTP 端口即可，避免自签名证书问题。
+  // 同理：App 内页面（https://localhost）和 http 页面都能直接发明文请求，
+  // 优先用 httpUrl —— 否则扫码拿到的 https://IP:8443 会撞上自签名证书，
+  // 表现为「扫码后同步异常 / 连不上」。
+  const canUseHttp = isNativeApp() || location.protocol !== 'https:';
+  const baseUrl = relay
+    ? device.httpUrl || device.url
+    : canUseHttp && device.httpUrl
+      ? device.httpUrl
+      : device.url;
   return new SyncClient({ baseUrl, code: code ?? device.code, relay });
 }
 
@@ -2675,7 +2785,7 @@ function openSyncPanel() {
               <button class="btn sm ghost" id="pair-rotate">换一个配对码</button>
             </div>
           </div>`;
-        drawQr(selfEl.querySelector('#pair-qr'), `${addr}/#pair=${info.code}`);
+        drawQr(selfEl.querySelector('#pair-qr'), `${addr}/#pair=${info.code}&http=${info.httpPort}`);
         selfEl.querySelector('#pair-rotate').onclick = async () => {
           try {
             const res = await rotatePairingCode();
@@ -2727,15 +2837,28 @@ function openSyncPanel() {
             const raw = String(text).trim();
             const m = raw.match(/[#&?](?:pair|code)=(\d{6})/);
             const code = m ? m[1] : '';
+            const httpPortMatch = raw.match(/[#&?]http=(\d{2,5})/);
             const url = raw.replace(/#.*$/, '');
             if (!/^https?:\/\//i.test(url)) {
               toast('二维码内容不是有效的设备地址', 'err');
               return;
             }
+            // 二维码里带了对方的 HTTP 端口就用它；没带就按默认端口推
+            let parsed;
+            try {
+              parsed = new URL(url);
+            } catch {
+              toast('二维码里的地址无法解析', 'err');
+              return;
+            }
+            const host = parsed.hostname;
+            const httpPort =
+              Number(httpPortMatch?.[1]) ||
+              (parsed.port === '8443' || !parsed.port ? 8787 : Number(parsed.port));
             openPairDialog({
-              name: hostOf(url) || '设备',
+              name: host || '设备',
               url,
-              httpUrl: url.replace(/^https:/, 'http:').replace(/:8443\b/, ':8787'),
+              httpUrl: `http://${host}:${httpPort}`,
               code,
             });
           },

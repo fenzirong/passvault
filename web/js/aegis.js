@@ -284,11 +284,14 @@ export function parseAegisDb(db) {
     const entryGroups = (Array.isArray(raw.groups) ? raw.groups : [])
       .map((g) => String(g || '').trim())
       .filter((g) => groupIds.has(g));
+    // 与「自己新建的 2FA 条目」保持同一形状：Aegis 的 name 是验证器账号，
+    // 放进 totp.account，而不是登录用的 username —— 否则详情页会多出一行
+    // 「用户名」，和手动添加的条目长得不一样。
     entries.push({
       id: String(raw.uuid || '').trim() || uuid(),
       type: 'login',
       title: issuer || name || '2FA 条目',
-      username: name,
+      username: '',
       password: '',
       url: '',
       notes: String(raw.note || ''),

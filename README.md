@@ -375,12 +375,22 @@ password-manager/
 ## 八、开发与测试
 
 ```bash
-npm test          # 61 个测试：加密、TOTP RFC 向量、迁移包解析、合并、CSV、生成器、快照、服务端 API、局域网发现、Aegis 互通（含 scrypt RFC 7914 向量）、分组
+npm test          # 65 个测试：加密、TOTP RFC 向量、迁移包解析、合并、CSV、生成器、快照、服务端 API、局域网发现、Aegis 互通（含 scrypt RFC 7914 向量）、分组
 npm run lan:check # 局域网自检：列出网卡 / 广播地址，监听 10 秒看能发现谁
 npm run desktop   # 以 Electron 桌面应用方式启动
 npm start         # 启动服务（默认 8787 端口）
 node server/server.js --port 9000 --data ./mydata --token 自定义口令
 ```
+
+### 1.5.4 修了什么
+
+| 现象 | 根因 | 修法 |
+| --- | --- | --- |
+| 电脑端没有分组（手机有） | Service Worker 是「缓存优先 + 后台更新」，升级后第一次打开仍是旧界面；桌面窗口长期不关，就一直跑旧代码 | 外壳文件（index.html / app.js / styles.css）改「网络优先」，其它资源 SWR；新 SW 接管后自动刷新一次 |
+| Aegis 导入的条目和自己新建的「格式不同」 | 导入把 Aegis 的账号塞进了 `username`，而手动新建的 2FA 条目账号只在 `totp.account`，详情页因此多一行「用户名」；编辑器也没有 HOTP / Steam / 5–8 位选项，一编辑就把类型改回普通 TOTP | 导入改为 `username: ''` + `totp.account`；编辑器新增类型选择（TOTP/HOTP/Steam）、5–8 位、计数器；保存时把表单里的类型参数全部带上 |
+| 导入时同发行方的第二个账号被当成重复丢掉 | 去重键只有 `title|username`，两个 GitHub 账号（标题相同、用户名都空）会撞键 | 去重键加上 `totp.account` |
+| 同步后生物识别解锁失效 | 生物识别包裹的是**派生密钥**，同步会把保险库换成对方的 salt / iterations，派生密钥随之改变，旧记录必然解不开 | 改为包裹**主密码**（同步不会改变它），解锁时按当前信封重新派生；旧记录自动兼容（先按主密码试，再按原始密钥试），彻底失效时清掉记录并提示重新启用 |
+| 扫码配对后同步异常 | 二维码里是 `https://IP:8443`，App 内直接请求会撞自签名证书 | App 内与 http 页面优先走对方的 `http://IP:8787`；二维码里额外带上 `http` 端口，扫码时按它拼地址 |
 
 ### 局域网发现排障（1.5.2）
 
