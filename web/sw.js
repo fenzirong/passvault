@@ -1,5 +1,5 @@
 // Service Worker：缓存应用外壳，断网也能打开（仅 https / localhost 生效）
-const CACHE = 'passvault-v5';
+const CACHE = 'passvault-v6';
 const ASSETS = [
   './',
   './index.html',
@@ -10,6 +10,7 @@ const ASSETS = [
   './js/crypto.js',
   './js/base32.js',
   './js/totp.js',
+  './js/aegis.js',
   './js/migration.js',
   './js/generator.js',
   './js/vault.js',

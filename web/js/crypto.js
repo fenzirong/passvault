@@ -155,6 +155,7 @@ export function createEmptyVault() {
     createdAt: ts,
     updatedAt: ts,
     entries: [],
+    groups: [],
     settings: {
       autoLockMinutes: 5,
       clipboardClearSeconds: 30,

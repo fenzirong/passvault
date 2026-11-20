@@ -51,7 +51,20 @@ import {
   parseCsvImport,
   parseJsonImport,
   purgeTombstones,
+  ensureGroups,
+  createGroup,
+  renameGroup,
+  deleteGroup,
+  groupNameMap,
+  mergeGroups,
 } from './vault.js';
+import {
+  importAegis,
+  exportAegis,
+  isAegisFile,
+  isEncryptedAegis,
+  countAegisExportable,
+} from './aegis.js';
 import {
   SyncClient,
   SyncError,
@@ -126,6 +139,7 @@ const state = {
   unlocked: false,
   dirty: false,
   filter: 'all',
+  groupFilter: null,
   query: '',
   selectedId: null,
   revealed: new Set(),
@@ -451,6 +465,7 @@ function enterApp() {
   state.query = '';
   $('#search').value = '';
   purgeTombstones(state.vault, 90);
+  ensureGroups(state.vault);
   render();
   startTotpTicker();
   resetIdle();
@@ -522,15 +537,19 @@ function updateSettings(patch) {
 function render() {
   if (!state.unlocked) return;
   renderFilters();
+  renderGroups();
   renderList();
   renderDetail();
 }
 
 function visibleEntries() {
-  let list = searchEntries(state.vault.entries, state.query);
+  const names = groupNameMap(state.vault);
+  let list = searchEntries(state.vault.entries, state.query, names);
   if (state.filter === 'fav') list = list.filter((e) => e.favorite);
   else if (state.filter === 'totp') list = list.filter((e) => e.totp);
   else if (state.filter === 'note') list = list.filter((e) => e.type === 'note');
+  if (state.groupFilter === '__none__') list = list.filter((e) => !(e.groups || []).length);
+  else if (state.groupFilter) list = list.filter((e) => (e.groups || []).includes(state.groupFilter));
   return sortEntries(list);
 }
 
@@ -550,6 +569,39 @@ function renderFilters() {
     .join('');
 }
 
+/** 分组筛选条：全部分组 / 未分组 / 每个分组 + 管理入口 */
+function renderGroups() {
+  const el = $('#groups');
+  if (!el) return;
+  const groups = (state.vault.groups || []).filter((g) => !g.deletedAt);
+  const alive = (state.vault.entries || []).filter((e) => !e.deletedAt);
+  const countOf = (id) => alive.filter((e) => (e.groups || []).includes(id)).length;
+  const ungrouped = alive.filter((e) => !(e.groups || []).length).length;
+
+  const chips = [
+    `<button class="chip sm ${!state.groupFilter ? 'active' : ''}" data-group="">全部分组</button>`,
+    ...groups.map(
+      (g) =>
+        `<button class="chip sm ${state.groupFilter === g.id ? 'active' : ''}" data-group="${escapeHtml(g.id)}">${escapeHtml(g.name)}<span class="count">${countOf(g.id)}</span></button>`,
+    ),
+  ];
+  if (ungrouped) {
+    chips.push(
+      `<button class="chip sm ${state.groupFilter === '__none__' ? 'active' : ''}" data-group="__none__">未分组<span class="count">${ungrouped}</span></button>`,
+    );
+  }
+  chips.push(`<button class="chip sm ghost" id="group-manage" title="管理分组">＋ 分组</button>`);
+  el.innerHTML = chips.join('');
+  el.querySelector('#group-manage').onclick = () => openGroupManager();
+  el.querySelectorAll('[data-group]').forEach((btn) => {
+    btn.onclick = () => {
+      state.groupFilter = btn.dataset.group || null;
+      renderGroups();
+      renderList();
+    };
+  });
+}
+
 function renderList() {
   const list = visibleEntries();
   const el = $('#entry-list');
@@ -562,6 +614,13 @@ function renderList() {
   el.innerHTML = list
     .map((e) => {
       const sub = e.type === 'note' ? '安全笔记' : e.username || hostOf(e.url) || '—';
+      const names = groupNameMap(state.vault);
+      const groupBadge = (e.groups || [])
+        .map((g) => names[g])
+        .filter(Boolean)
+        .slice(0, 2)
+        .map((n) => `<span class="badge group">${escapeHtml(n)}</span>`)
+        .join('');
       return `<button class="entry-item ${e.id === state.selectedId ? 'active' : ''}" data-id="${e.id}">
         <span class="avatar" style="background:${colorOf(e.title)}">${escapeHtml(initialsOf(e.title))}</span>
         <span class="entry-main">
@@ -569,6 +628,7 @@ function renderList() {
           <span class="entry-sub">${escapeHtml(sub)}</span>
         </span>
         <span class="entry-badges">
+          ${groupBadge}
           ${e.totp ? '<span class="badge totp">2FA</span>' : ''}
           ${e.type === 'note' ? '<span class="badge note">笔记</span>' : ''}
           ${e.favorite ? '<span class="badge star">★</span>' : ''}
@@ -646,6 +706,15 @@ function renderDetail() {
     ? `<div class="tags">${entry.tags.map((t) => `<span class="tag">${escapeHtml(t)}</span>`).join('')}</div>`
     : '';
 
+  const names = groupNameMap(state.vault);
+  const groupChips = (entry.groups || []).length
+    ? `<div class="tags">${(entry.groups || [])
+        .map((g) => names[g])
+        .filter(Boolean)
+        .map((n) => `<span class="tag group-tag">${escapeHtml(n)}</span>`)
+        .join('')}</div>`
+    : '';
+
   el.innerHTML = `
     <div class="detail-head">
       <button class="icon-btn only-mobile" data-act="back" title="返回">${icon('back')}</button>
@@ -662,6 +731,7 @@ function renderDetail() {
     </div>
     ${rows.length ? `<div class="card">${rows.join('')}</div>` : ''}
     ${entry.notes ? `<div class="card"><div class="row-label" style="padding:12px 16px 0">备注</div><div class="notes-block">${escapeHtml(entry.notes)}</div></div>` : ''}
+    ${groupChips}
     ${tags}
     <div class="meta-line">
       <span>创建于 ${formatDateTime(entry.createdAt)}</span>
@@ -904,6 +974,149 @@ function promptPassword({ title, message, okText = '确定' }) {
   });
 }
 
+/* ============================== 分组管理 ============================== */
+
+/** 通用文本输入弹窗 */
+function promptText({ title, message = '', label = '名称', value = '', placeholder = '', okText = '确定' }) {
+  return new Promise((resolve) => {
+    let settled = false;
+    openModal({
+      title,
+      body: `${message ? `<p style="margin:0 0 14px;font-size:13.5px;line-height:1.7;color:var(--muted)">${escapeHtml(message)}</p>` : ''}
+        <label class="field"><span class="field-label">${escapeHtml(label)}</span>
+        <input type="text" id="prompt-text" value="${escapeHtml(value)}" placeholder="${escapeHtml(placeholder)}" maxlength="60"></label>`,
+      footer: `<button class="btn ghost" data-cancel>取消</button>
+               <button class="btn primary" data-ok>${escapeHtml(okText)}</button>`,
+      onMount(root, closeFn) {
+        const input = root.querySelector('#prompt-text');
+        setTimeout(() => {
+          input.focus();
+          input.select();
+        }, 80);
+        const submit = () => {
+          const text = input.value.trim();
+          if (!text) return;
+          settled = true;
+          closeFn();
+          resolve(text);
+        };
+        root.querySelector('[data-ok]').onclick = submit;
+        root.querySelector('[data-cancel]').onclick = () => {
+          settled = true;
+          closeFn();
+          resolve(null);
+        };
+        input.addEventListener('keydown', (e) => {
+          if (e.key === 'Enter') submit();
+        });
+      },
+      onClose: () => {
+        if (!settled) resolve(null);
+      },
+    });
+  });
+}
+
+/** 分组管理：新建 / 重命名 / 删除 */
+function openGroupManager() {
+  const renderList = () => {
+    const groups = (state.vault.groups || []).filter((g) => !g.deletedAt);
+    const alive = (state.vault.entries || []).filter((e) => !e.deletedAt);
+    if (!groups.length) {
+      return `<div class="empty-list" style="padding:20px 10px">还没有分组<br>在下面输入名称即可创建</div>`;
+    }
+    return groups
+      .map((g) => {
+        const count = alive.filter((e) => (e.groups || []).includes(g.id)).length;
+        return `<div class="setting-row">
+          <div class="text"><b>${escapeHtml(g.name)}</b><span>${count} 个条目</span></div>
+          <div style="display:flex;gap:6px">
+            <button class="btn sm ghost" data-rename="${escapeHtml(g.id)}">重命名</button>
+            <button class="btn sm ghost" data-del="${escapeHtml(g.id)}">删除</button>
+          </div>
+        </div>`;
+      })
+      .join('');
+  };
+
+  openModal({
+    title: '分组管理',
+    wide: true,
+    body: `<div id="gm-list">${renderList()}</div>
+      <div style="display:flex;gap:8px;margin-top:14px">
+        <input id="gm-name" type="text" placeholder="新分组名称" maxlength="40" style="flex:1">
+        <button class="btn primary" id="gm-add">创建</button>
+      </div>
+      <p class="hint">分组与 Aegis 互通：导入 Aegis 备份会自动建组，导出时一并带上。</p>`,
+    footer: `<button class="btn primary" data-close>完成</button>`,
+    onMount(root, close) {
+      const listEl = root.querySelector('#gm-list');
+      const refresh = () => {
+        listEl.innerHTML = renderList();
+      };
+      root.querySelector('#gm-add').onclick = () => {
+        const input = root.querySelector('#gm-name');
+        const name = input.value.trim();
+        if (!name) return;
+        try {
+          createGroup(state.vault, name);
+          input.value = '';
+          scheduleSave();
+          refresh();
+          render();
+          toast('分组已创建', 'ok');
+        } catch (err) {
+          toast(err.message, 'err');
+        }
+      };
+      root.querySelector('#gm-name').addEventListener('keydown', (e) => {
+        if (e.key === 'Enter') root.querySelector('#gm-add').click();
+      });
+      listEl.addEventListener('click', async (ev) => {
+        const renameBtn = ev.target.closest('[data-rename]');
+        if (renameBtn) {
+          const id = renameBtn.dataset.rename;
+          const group = (state.vault.groups || []).find((g) => g.id === id);
+          if (!group) return;
+          const name = await promptText({
+            title: '重命名分组',
+            label: '分组名称',
+            value: group.name,
+            okText: '保存',
+          });
+          if (!name) return;
+          renameGroup(state.vault, id, name);
+          scheduleSave();
+          refresh();
+          render();
+          toast('已重命名', 'ok');
+          return;
+        }
+        const delBtn = ev.target.closest('[data-del]');
+        if (delBtn) {
+          const id = delBtn.dataset.del;
+          const group = (state.vault.groups || []).find((g) => g.id === id);
+          if (!group) return;
+          const ok = await confirmDialog({
+            title: '删除分组',
+            message: `确定删除分组「${group.name}」吗？组内条目会保留，只是不再属于这个分组。`,
+            okText: '删除',
+            danger: true,
+          });
+          if (!ok) return;
+          deleteGroup(state.vault, id);
+          if (state.groupFilter === id) state.groupFilter = null;
+          scheduleSave();
+          refresh();
+          render();
+          toast('分组已删除', 'ok');
+        }
+      });
+      root.querySelector('[data-close]').onclick = close;
+    },
+  });
+}
+
 /* ============================== 条目编辑 ============================== */
 
 function openEditor(entry = null) {
@@ -976,6 +1189,22 @@ function openEditor(entry = null) {
     <label class="field"><span class="field-label">标签</span>
       <input id="f-tags" type="text" value="${escapeHtml((e.tags || []).join(', '))}" placeholder="用逗号分隔，例如：工作, 邮箱">
     </label>
+    <div class="field"><span class="field-label">分组（可多选，与 Aegis 分组互通）</span>
+      <div class="group-picker" id="f-groups">
+        ${(state.vault.groups || [])
+          .filter((g) => !g.deletedAt)
+          .map(
+            (g) =>
+              `<button type="button" class="chip sm ${(e.groups || []).includes(g.id) ? 'active' : ''}" data-gid="${escapeHtml(g.id)}">${escapeHtml(g.name)}</button>`,
+          )
+          .join('')}
+        <button type="button" class="chip sm ghost" id="f-new-group">＋ 新建分组</button>
+      </div>
+      <div id="f-new-group-row" hidden style="display:flex;gap:8px;margin-top:8px">
+        <input id="f-new-group-name" type="text" placeholder="分组名称" maxlength="40" style="flex:1">
+        <button type="button" class="btn sm primary" id="f-new-group-ok">添加</button>
+      </div>
+    </div>
     <label class="check ${e.favorite ? 'on' : ''}" id="f-fav-wrap" style="margin-bottom:4px">
       <input type="checkbox" id="f-fav" ${e.favorite ? 'checked' : ''}> 加入收藏
     </label>
@@ -1005,6 +1234,43 @@ function openEditor(entry = null) {
       const favWrap = root.querySelector('#f-fav-wrap');
       root.querySelector('#f-fav').onchange = (ev) => {
         favWrap.classList.toggle('on', ev.target.checked);
+      };
+
+      // 分组多选
+      const groupPicker = root.querySelector('#f-groups');
+      const selectedGroups = new Set(e.groups || []);
+      groupPicker.addEventListener('click', (ev) => {
+        const chip = ev.target.closest('[data-gid]');
+        if (!chip) return;
+        const id = chip.dataset.gid;
+        if (selectedGroups.has(id)) selectedGroups.delete(id);
+        else selectedGroups.add(id);
+        chip.classList.toggle('active', selectedGroups.has(id));
+      });
+      const newGroupRow = root.querySelector('#f-new-group-row');
+      root.querySelector('#f-new-group').onclick = () => {
+        newGroupRow.hidden = !newGroupRow.hidden;
+        if (!newGroupRow.hidden) root.querySelector('#f-new-group-name').focus();
+      };
+      root.querySelector('#f-new-group-ok').onclick = () => {
+        const input = root.querySelector('#f-new-group-name');
+        const name = input.value.trim();
+        if (!name) return;
+        try {
+          const group = createGroup(state.vault, name);
+          selectedGroups.add(group.id);
+          const chip = document.createElement('button');
+          chip.type = 'button';
+          chip.className = 'chip sm active';
+          chip.dataset.gid = group.id;
+          chip.textContent = group.name;
+          groupPicker.insertBefore(chip, root.querySelector('#f-new-group'));
+          input.value = '';
+          newGroupRow.hidden = true;
+          scheduleSave();
+        } catch (err) {
+          toast(err.message, 'err');
+        }
       };
 
       const totpInput = root.querySelector('#f-totp');
@@ -1130,6 +1396,7 @@ function openEditor(entry = null) {
           url: type === 'note' ? '' : url,
           notes,
           tags,
+          groups: Array.from(selectedGroups),
           favorite,
           totp: type === 'note' ? null : totpData,
           updatedAt: nowISO(),
@@ -1374,12 +1641,16 @@ function openSettings(tab = 'general') {
       <button class="btn sm ghost" id="set-import-vault">导入</button>
     </div>
     <div class="setting-row">
-      <div class="text"><b>导入明文数据</b><span>CSV / JSON / 2FA 密钥</span></div>
+      <div class="text"><b>导入明文数据</b><span>CSV / JSON / Aegis 备份（明文或加密）/ 2FA 密钥</span></div>
       <button class="btn sm ghost" id="set-import">导入</button>
     </div>
     <div class="setting-row">
-      <div class="text"><b>导出明文</b><span>CSV / JSON，便于迁移到其他软件（注意安全）</span></div>
+      <div class="text"><b>导出明文</b><span>CSV / JSON / Aegis 备份，便于迁移到其他软件（注意安全）</span></div>
       <button class="btn sm ghost" id="set-export-plain">导出</button>
+    </div>
+    <div class="setting-row">
+      <div class="text"><b>分组管理</b><span>当前 ${(state.vault.groups || []).filter((g) => !g.deletedAt).length} 个分组 · 与 Aegis 分组互通</span></div>
+      <button class="btn sm ghost" id="set-groups">管理</button>
     </div>
     <div class="setting-row">
       <div class="text"><b>清空所有数据</b><span>删除本机保险库与自动备份，操作不可恢复</span></div>
@@ -1394,7 +1665,7 @@ function openSettings(tab = 'general') {
 
     <div class="section-title">关于</div>
     <p class="hint" style="margin:0">
-      密码保险库 v1.5.1 · 本地加密，零依赖。<br>
+      密码保险库 v1.5.3 · 本地加密，零依赖。<br>
       加密：PBKDF2-SHA256（${KDF_ITERATIONS.toLocaleString()} 次）+ AES-256-GCM；2FA：RFC 6238 TOTP。<br>
       参考开源项目：KeePassXC、KeePassDX、Bitwarden、Aegis Authenticator；二维码解码使用 jsQR（Apache-2.0）。
     </p>
@@ -1478,6 +1749,10 @@ function openSettings(tab = 'general') {
       root.querySelector('#set-export-plain').onclick = () => {
         close();
         openExportPlain();
+      };
+      root.querySelector('#set-groups').onclick = () => {
+        close();
+        openGroupManager();
       };
       root.querySelector('#set-wipe').onclick = async () => {
         const ok = await confirmDialog({
@@ -1605,12 +1880,56 @@ function openImport() {
         };
       });
 
-      const showPreview = (entries, source) => {
-        parsed = entries;
+      const showPreview = (result, source) => {
+        const entries = Array.isArray(result) ? result : result?.entries || [];
+        const groups = Array.isArray(result) ? [] : result?.groups || [];
+        const skipped = Array.isArray(result) ? [] : result?.skipped || [];
+        parsed = { entries, groups };
         okBtn.disabled = !entries.length;
-        preview.innerHTML = entries.length
-          ? `已识别 <b>${entries.length}</b> 条（${escapeHtml(source)}），其中含 2FA 的 <b>${entries.filter((e) => e.totp).length}</b> 条。`
-          : '没有识别到可导入的数据';
+        if (!entries.length) {
+          preview.innerHTML = '没有识别到可导入的数据';
+          return;
+        }
+        const parts = [
+          `已识别 <b>${entries.length}</b> 条（${escapeHtml(source)}）`,
+          `含 2FA 的 <b>${entries.filter((e) => e.totp).length}</b> 条`,
+        ];
+        if (groups.length) parts.push(`分组 <b>${groups.length}</b> 个`);
+        if (skipped.length) {
+          parts.push(
+            `<span style="color:var(--warning)">跳过 ${skipped.length} 条：${escapeHtml(
+              skipped
+                .slice(0, 3)
+                .map((s) => `${s.name}（${s.reason}）`)
+                .join('；'),
+            )}${skipped.length > 3 ? '…' : ''}</span>`,
+          );
+        }
+        preview.innerHTML = `${parts.join('，')}。`;
+      };
+
+      /** Aegis 文件：明文直接解析，加密的先要密码 */
+      const importAegisText = async (text) => {
+        try {
+          const result = await importAegis(text);
+          showPreview(result, 'Aegis 明文备份');
+        } catch (err) {
+          if (err.code !== 'NEED_PASSWORD') throw err;
+          const password = await promptPassword({
+            title: 'Aegis 加密备份',
+            message: '这个 Aegis 备份是加密的，请输入导出时设置的密码。',
+            okText: '解密',
+          });
+          if (!password) {
+            parsed = null;
+            okBtn.disabled = true;
+            preview.innerHTML = '已取消解密';
+            return;
+          }
+          preview.innerHTML = '正在用 scrypt 解密…';
+          const result = await importAegis(text, { password });
+          showPreview(result, 'Aegis 加密备份');
+        }
       };
 
       const parseText = (text, name = '') => {
@@ -1633,8 +1952,19 @@ function openImport() {
           }
           if (trimmed.startsWith('{') || trimmed.startsWith('[')) {
             const data = JSON.parse(trimmed);
+            if (isAegisFile(data)) {
+              importAegisText(trimmed).catch((err) => {
+                parsed = null;
+                okBtn.disabled = true;
+                preview.innerHTML = `<span style="color:var(--danger)">${escapeHtml(err.message)}</span>`;
+              });
+              return;
+            }
             if (data.application === 'dsh-passvault' || (Array.isArray(data.entries) && data.entries[0]?.id)) {
-              showPreview((data.entries || []).map(normalizeEntry), '本应用 JSON');
+              showPreview(
+                { entries: (data.entries || []).map(normalizeEntry), groups: data.groups || [] },
+                '本应用 JSON',
+              );
             } else if (data.entries?.[0]?.info || (Array.isArray(data) && data[0]?.secret)) {
               const list = parseAnyTotp(trimmed);
               showPreview(
@@ -1685,26 +2015,34 @@ function openImport() {
 
       root.querySelector('[data-cancel]').onclick = close;
       okBtn.onclick = () => {
-        if (!parsed?.length) return;
+        const entries = parsed?.entries || [];
+        if (!entries.length) return;
+        ensureGroups(state.vault);
+        // 分组先并入保险库，再把条目上的分组 id 换成最终 id
+        const groupMap = mergeGroups(state.vault, parsed.groups || []);
         const existing = new Set(
           state.vault.entries.filter((e) => !e.deletedAt).map((e) => `${e.title}|${e.username}`),
         );
         let added = 0;
         let skipped = 0;
-        for (const item of parsed) {
+        for (const item of entries) {
           const key = `${item.title}|${item.username}`;
           if (existing.has(key)) {
             skipped++;
             continue;
           }
-          state.vault.entries.push(normalizeEntry({ ...item, id: uuid() }));
+          const groups = (item.groups || []).map((g) => groupMap.get(g) || g).filter(Boolean);
+          state.vault.entries.push(normalizeEntry({ ...item, groups, id: uuid() }));
           existing.add(key);
           added++;
         }
         scheduleSave();
         render();
         close();
-        toast(`已导入 ${added} 条${skipped ? `，跳过重复 ${skipped} 条` : ''}`, 'ok');
+        toast(
+          `已导入 ${added} 条${skipped ? `，跳过重复 ${skipped} 条` : ''}${groupMap.size ? `，分组 ${groupMap.size} 个` : ''}`,
+          'ok',
+        );
       };
     },
   });
@@ -1867,25 +2205,32 @@ function importEncryptedBackup() {
 }
 
 function openExportPlain() {
+  const aegisCount = countAegisExportable(state.vault);
   openModal({
     title: '导出明文数据',
     body: `<p class="hint" style="margin:0 0 14px;color:var(--warning)">
         导出的文件包含明文密码，请仅在可信设备上操作，用完后及时删除。</p>
       <div class="choice-list">
         <button class="choice" data-kind="csv"><span class="num">1</span><span><b>CSV（Bitwarden 兼容）</b><span>可导入 Bitwarden、1Password、KeePass 等</span></span></button>
-        <button class="choice" data-kind="json"><span class="num">2</span><span><b>JSON（本应用格式）</b><span>包含全部字段与 2FA 密钥</span></span></button>
+        <button class="choice" data-kind="json"><span class="num">2</span><span><b>JSON（本应用格式）</b><span>包含全部字段、分组与 2FA 密钥</span></span></button>
         <button class="choice" data-kind="otp"><span class="num">3</span><span><b>2FA 链接列表</b><span>otpauth:// 文本，可导入其他验证器</span></span></button>
+        <button class="choice" data-kind="aegis"><span class="num">4</span><span><b>Aegis 明文备份</b><span>${aegisCount} 条 2FA + 分组，Aegis 可直接导入</span></span></button>
+        <button class="choice" data-kind="aegis-enc"><span class="num">5</span><span><b>Aegis 加密备份</b><span>scrypt + AES-256-GCM，与 Aegis 加密导出完全一致</span></span></button>
       </div>`,
     onMount(root, close) {
       $$('.choice', root).forEach((btn) => {
-        btn.onclick = () => {
+        btn.onclick = async () => {
           const kind = btn.dataset.kind;
           const alive = state.vault.entries.filter((e) => !e.deletedAt);
           if (kind === 'csv') {
-            downloadFile(`密码保险库-${dateStamp()}.csv`, '\uFEFF' + exportCsv(alive), 'text/csv');
+            downloadFile(
+              `密码保险库-${dateStamp()}.csv`,
+              '\uFEFF' + exportCsv(alive, groupNameMap(state.vault)),
+              'text/csv',
+            );
           } else if (kind === 'json') {
             downloadFile(`密码保险库-${dateStamp()}.json`, exportJson(state.vault), 'application/json');
-          } else {
+          } else if (kind === 'otp') {
             const lines = alive
               .filter((e) => e.totp)
               .map((e) => buildOtpauthUri({ ...e.totp, issuer: e.totp.issuer || e.title, account: e.totp.account || e.username }));
@@ -1894,6 +2239,32 @@ function openExportPlain() {
               return;
             }
             downloadFile(`2fa-${dateStamp()}.txt`, lines.join('\n'), 'text/plain');
+          } else if (kind === 'aegis' || kind === 'aegis-enc') {
+            if (!aegisCount) {
+              toast('没有包含 2FA 的条目，Aegis 备份会是空的', 'warn');
+              return;
+            }
+            let password = '';
+            if (kind === 'aegis-enc') {
+              password = await promptPassword({
+                title: '加密导出 Aegis 备份',
+                message: '设置一个密码，之后在 Aegis 里导入这个文件时需要输入它。密码不会被保存。',
+                okText: '导出',
+              });
+              if (!password) return;
+              toast('正在用 scrypt 加密…', 'ok', 4000);
+            }
+            try {
+              const text = await exportAegis(state.vault, { password });
+              downloadFile(
+                `${password ? 'aegis-export' : 'aegis-export-plain'}-${dateStamp()}.json`,
+                text,
+                'application/json',
+              );
+            } catch (err) {
+              toast(`导出失败：${err.message}`, 'err', 4000);
+              return;
+            }
           }
           close();
           toast('已导出', 'ok');

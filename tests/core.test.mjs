@@ -248,7 +248,7 @@ test('CSV 导出后可再次导入', () => {
     }),
   ];
   const csv = exportCsv(entries);
-  const parsed = parseCsvImport(csv);
+  const { entries: parsed } = parseCsvImport(csv);
   assert.equal(parsed.length, 1);
   assert.equal(parsed[0].title, '示例, 带逗号');
   assert.equal(parsed[0].password, 'p"a,ss');
@@ -258,12 +258,12 @@ test('CSV 导出后可再次导入', () => {
 
 test('兼容 Chrome / KeePass 风格 CSV 表头', () => {
   const chrome = 'name,url,username,password\nGitHub,https://github.com,alice,secret123\n';
-  const parsed = parseCsvImport(chrome);
+  const { entries: parsed } = parseCsvImport(chrome);
   assert.equal(parsed[0].title, 'GitHub');
   assert.equal(parsed[0].username, 'alice');
 
   const keepass = '\uFEFF"Account","Login Name","Password","Web Site","Comments"\n"邮箱","me","pw","mail.com","备注"\n';
-  const parsed2 = parseCsvImport(keepass);
+  const { entries: parsed2 } = parseCsvImport(keepass);
   assert.equal(parsed2[0].title, '邮箱');
   assert.equal(parsed2[0].url, 'mail.com');
 });
@@ -272,7 +272,7 @@ test('JSON 导出后可再次导入', () => {
   const vault = createEmptyVault();
   vault.entries.push(normalizeEntry({ title: 'X', username: 'u', password: 'p' }));
   const json = exportJson(vault);
-  const parsed = parseJsonImport(json);
+  const { entries: parsed } = parseJsonImport(json);
   assert.equal(parsed[0].title, 'X');
 });
 

@@ -2,6 +2,7 @@
 import { b64decode, b64urlDecode } from './util.js';
 import { base32Encode } from './base32.js';
 import { normalizeTotp, parseOtpauthUri } from './totp.js';
+import { isAegisFile, parseAegisDb } from './aegis.js';
 
 /* ------------------------- 极简 Protobuf 解析 ------------------------- */
 
@@ -99,28 +100,15 @@ export function parseGoogleMigration(uri) {
 
 /* ------------------------- 其他常见导出格式 ------------------------- */
 
-/** Aegis Authenticator 明文 JSON 导出 */
+/**
+ * Aegis Authenticator 导出（明文）
+ * 真正的解析在 aegis.js 里（含加密格式与分组），这里只保留「取 2FA 列表」的旧接口。
+ */
 export function parseAegis(json) {
   const data = typeof json === 'string' ? JSON.parse(json) : json;
-  const list = Array.isArray(data) ? data : data.entries;
-  if (!Array.isArray(list)) throw new Error('不是有效的 Aegis 导出文件');
-  const out = [];
-  for (const e of list) {
-    if (!e || !e.info || !e.info.secret) continue;
-    if (e.type && e.type !== 'totp' && e.type !== 'hotp') continue;
-    out.push(
-      normalizeTotp({
-        secret: e.info.secret,
-        issuer: e.issuer || '',
-        account: e.name || e.account || '',
-        algorithm: e.info.algo || 'SHA1',
-        digits: e.info.digits || 6,
-        period: e.info.period || 30,
-        type: e.type || 'totp',
-        counter: e.info.counter || 0,
-      }),
-    );
-  }
+  const db = data?.db && typeof data.db === 'object' ? data.db : data;
+  const { entries } = parseAegisDb(db);
+  const out = entries.map((e) => e.totp).filter(Boolean);
   if (!out.length) throw new Error('Aegis 文件中没有可用的 2FA 条目');
   return out;
 }
@@ -190,6 +178,12 @@ export function parseAnyTotp(input) {
   if (/^otpauth:\/\//i.test(text)) return [normalizeTotp(parseOtpauthUri(text))];
   if (text.startsWith('{') || text.startsWith('[')) {
     const data = JSON.parse(text);
+    if (isAegisFile(data)) {
+      if (typeof data.db === 'string') {
+        throw new Error('这是加密的 Aegis 备份，请到「设置 → 导入」选择文件并输入密码');
+      }
+      return parseAegis(data);
+    }
     if (Array.isArray(data) || data.entries) {
       if (data.entries && data.entries[0]?.info) return parseAegis(data);
       if (Array.isArray(data) && data[0]?.secret) return parseAndOtp(data);

@@ -511,6 +511,49 @@ select {
   opacity: 0.75;
 }
 
+/* 分组筛选条 */
+.groups {
+  display: flex;
+  gap: 6px;
+  padding: 0 12px 8px;
+  overflow-x: auto;
+  scrollbar-width: none;
+  flex-wrap: nowrap;
+}
+.groups::-webkit-scrollbar {
+  display: none;
+}
+.groups:empty {
+  display: none;
+}
+.chip.sm {
+  height: 26px;
+  padding: 0 10px;
+  font-size: 12px;
+  font-weight: 500;
+}
+.chip.ghost {
+  background: transparent;
+  border-style: dashed;
+}
+.group-picker {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+.badge.group {
+  background: color-mix(in srgb, var(--accent) 14%, transparent);
+  color: var(--accent);
+  max-width: 96px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.tag.group-tag {
+  border-color: color-mix(in srgb, var(--accent) 40%, transparent);
+  color: var(--accent);
+}
+
 .list {
   flex: 1;
   overflow-y: auto;
