@@ -32,6 +32,9 @@ public class PassVaultService extends Service {
     public static String deviceName = "安卓手机";
     public static PassVaultServerPlugin plugin;
 
+    private Thread watchdog;
+    private volatile boolean watchdogRunning = false;
+
     @Override
     public void onCreate() {
         super.onCreate();
@@ -56,36 +59,110 @@ public class PassVaultService extends Service {
             startForeground(NOTIFICATION_ID, notification);
         }
 
+        startComponents();
+        startWatchdog();
+        return START_STICKY;
+    }
+
+    /**
+     * 启动 HTTP 服务 + 广播 + 发现。任何一步失败都不影响其他步骤，
+     * 失败的步骤交给看门狗下一轮重试 —— 旧实现一旦抛异常就永久 port=0，
+     * 手机从此在局域网里彻底「隐身」。
+     */
+    private void startComponents() {
+        if (store == null) store = new VaultStore(this);
+
         if (server == null) {
-            store = new VaultStore(this);
-            server = new VaultHttpServer(store, pairingCode, deviceId, deviceName, envelope -> {
-                PassVaultServerPlugin p = plugin;
-                if (p != null) {
-                    JSONObject data = new JSONObject();
-                    try {
-                        data.put("envelope", envelope);
-                    } catch (Exception ignored) {
-                        // 忽略
-                    }
-                    p.emitVaultUpdated(data);
-                }
-            });
+            VaultHttpServer instance = new VaultHttpServer(
+                store,
+                pairingCode,
+                deviceId,
+                deviceName,
+                this::emitVaultUpdated
+            );
             try {
-                server.start();
-                port = server.getPort();
-                announcer = new UdpAnnouncer(deviceId, deviceName, port);
-                announcer.start();
-                discovery = new UdpDiscovery(this, deviceId);
-                discovery.start();
+                instance.start();
+                server = instance;
+                port = instance.getPort();
             } catch (Exception e) {
+                try {
+                    instance.stop();
+                } catch (Exception ignored) {
+                    // 忽略
+                }
+                server = null;
                 port = 0;
             }
+        } else {
+            server.updateAuth(pairingCode);
+            server.setDeviceName(deviceName);
+            port = server.getPort();
         }
-        return START_STICKY;
+
+        if (port > 0) {
+            if (announcer == null || !announcer.isRunning()) {
+                announcer = new UdpAnnouncer(deviceId, deviceName, port);
+                announcer.start();
+            }
+            if (discovery == null || !discovery.isRunning()) {
+                discovery = new UdpDiscovery(this, deviceId);
+                discovery.start();
+            }
+        }
+    }
+
+    private void emitVaultUpdated(JSONObject envelope) {
+        PassVaultServerPlugin p = plugin;
+        if (p == null) return;
+        try {
+            JSONObject data = new JSONObject();
+            data.put("envelope", envelope);
+            p.emitVaultUpdated(data);
+        } catch (Exception ignored) {
+            // 忽略
+        }
+    }
+
+    /** 每 10 秒自检：端口掉了、广播线程死了、发现线程死了都会自动拉起 */
+    private void startWatchdog() {
+        if (watchdogRunning) return;
+        watchdogRunning = true;
+        watchdog = new Thread(() -> {
+            while (watchdogRunning) {
+                try {
+                    Thread.sleep(10_000);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    break;
+                }
+                if (!watchdogRunning) break;
+                try {
+                    if (port == 0 || server == null) {
+                        if (server != null) {
+                            try {
+                                server.stop();
+                            } catch (Exception ignored) {
+                                // 忽略
+                            }
+                            server = null;
+                        }
+                    }
+                    startComponents();
+                } catch (Exception ignored) {
+                    // 看门狗自己不能死
+                }
+            }
+        }, "passvault-watchdog");
+        watchdog.setDaemon(true);
+        watchdog.start();
     }
 
     @Override
     public void onDestroy() {
+        watchdogRunning = false;
+        Thread wd = watchdog;
+        watchdog = null;
+        if (wd != null) wd.interrupt();
         if (announcer != null) {
             announcer.stop();
             announcer = null;

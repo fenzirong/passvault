@@ -2049,6 +2049,69 @@ function drawQr(container, text) {
   }
 }
 
+/** 取 IPv4 的 /24 前缀，用于判断两台设备是不是同一网段 */
+function subnetOf(ip) {
+  const m = String(ip || '').match(/^(\d{1,3}\.\d{1,3}\.\d{1,3})\.\d{1,3}$/);
+  return m ? m[1] : '';
+}
+
+/**
+ * 从发现结果里挑一个「本机连得上」的地址。
+ * 多网卡设备会把 Hyper-V / WSL / Docker 的地址一起广播出来，
+ * 直接用第一个经常是虚拟网卡，对方永远连不上。
+ */
+function pickPeerHost(peer, selfAddresses = []) {
+  const host = String(peer.host || '').trim();
+  const candidates = [];
+  if (host) candidates.push(host);
+  for (const addr of peer.addresses || []) {
+    const value = String(addr || '').trim();
+    if (value && !candidates.includes(value)) candidates.push(value);
+  }
+  if (!candidates.length) return '';
+
+  const localSubnets = new Set();
+  for (const item of selfAddresses) {
+    const addr = typeof item === 'string' ? item : item?.address;
+    const sn = subnetOf(addr);
+    if (sn) localSubnets.add(sn);
+  }
+  const pageSn = subnetOf(location.hostname);
+  if (pageSn) localSubnets.add(pageSn);
+
+  // 与本机同网段的地址最可信（广播/组播本来就只在同网段内传播）
+  const sameSubnet = candidates.find((c) => localSubnets.has(subnetOf(c)));
+  if (sameSubnet) return sameSubnet;
+  // 退而求其次：去掉链路本地地址
+  const usable = candidates.find((c) => !c.startsWith('169.254.'));
+  return usable || candidates[0];
+}
+
+/** 把用户输入的地址补全成可用的 URL：192.168.1.10 → http://192.168.1.10:8787 */
+function completeAddress(input) {
+  const raw = String(input || '').trim();
+  if (!raw) return '';
+  const secure = /^https:\/\//i.test(raw);
+  let text = raw.replace(/^(https?):\/\//i, '').replace(/\/+$/, '');
+  const [hostPart] = text.split('/');
+  const hasPort = /:\d{2,5}$/.test(hostPart);
+  const proto = secure ? 'https' : 'http';
+  const port = hasPort ? '' : proto === 'https' ? ':8443' : ':8787';
+  return `${proto}://${hostPart}${port}${text.slice(hostPart.length)}`;
+}
+
+/** 同步失败时的可执行提示（区分「连不上」和「权限」） */
+function syncErrorText(err) {
+  const code = err?.code || '';
+  if (code === 'NETWORK' || code === 'TIMEOUT') {
+    if (location.protocol === 'https:' && !isNativeApp()) {
+      return `${err.message}：HTTPS 页面无法直连对方的 HTTP 端口，请改用对方提供的 HTTPS 地址，或先与当前页面所在的电脑配对（启用中继）`;
+    }
+    return `${err.message}：请确认两台设备在同一 Wi-Fi、对方已打开同步服务、Windows 防火墙已放行`;
+  }
+  return err?.message || '同步失败';
+}
+
 function deviceRow({ name, host, url, httpUrl, platform, self, selfLabel = '本机', kind = 'pc' }) {
   const paired = state.sync.devices.some((d) => sameOrigin(d.url, url));
   return `<div class="device-row">
@@ -2158,13 +2221,15 @@ function openSyncPanel() {
             // 自己的影子设备不显示
             if (peer.shadow && peer.shadowId === state.deviceId) continue;
             const suffix = peer.shadow ? `/shadow/${encodeURIComponent(peer.shadowId)}` : '';
-            const httpUrl = `http://${peer.host}:${peer.httpPort}${suffix}`;
+            // 多网卡设备的 announce 会带上一串地址，挑与本机同网段的那个
+            const host = pickPeerHost(peer, data.self?.addresses || []) || peer.host;
+            const httpUrl = `http://${host}:${peer.httpPort}${suffix}`;
             const url =
-              useHttps && peer.httpsPort ? `https://${peer.host}:${peer.httpsPort}${suffix}` : httpUrl;
+              useHttps && peer.httpsPort ? `https://${host}:${peer.httpsPort}${suffix}` : httpUrl;
             rows.push(
               deviceRow({
                 name: peer.name,
-                host: `${peer.host}:${peer.httpPort}`,
+                host: `${host}:${peer.httpPort}`,
                 url,
                 httpUrl,
                 platform: peer.platform,
@@ -2189,6 +2254,25 @@ function openSyncPanel() {
       };
 
       const renderSelf = async () => {
+        // 安卓 App 的页面地址是 https://localhost，hostname 永远是 localhost，
+        // 所以必须先判断「是不是原生 App」，否则永远走不显示配对码的分支 ——
+        // 电脑端拿不到手机配对码，配对必然失败。
+        if (isNativeApp()) {
+          const st = await nativeServerStatus();
+          const code = escapeHtml(st?.code || phonePairCode());
+          const ips = (st?.addresses || []).filter((a) => typeof a === 'string' && a);
+          const addrLine = st?.running
+            ? `${escapeHtml(ips[0] || '')}${ips[0] ? `:${st.port}` : `端口 ${st.port}`} · 后台服务运行中，锁屏也能被访问`
+            : '后台服务未启动：解锁后会自动重试，锁屏期间无法被连接';
+          selfEl.innerHTML = `<div class="pair-card">
+            <div class="pair-info">
+              <div class="pair-label">本机配对码（手机）</div>
+              <div class="pair-code">${code}</div>
+              <div class="pair-addr" data-addr="${escapeHtml(ips[0] || '')}">${addrLine}</div>
+            </div>
+          </div>`;
+          return;
+        }
         // 配对码只在本机可见，其他设备不请求，避免无谓的 403
         const isLocal =
           location.hostname === '127.0.0.1' ||
@@ -2196,20 +2280,6 @@ function openSyncPanel() {
           location.hostname === '::1' ||
           location.hostname === '[::1]';
         if (!isLocal) {
-          // 安卓：后台服务运行中时显示本机配对码
-          if (state.nativeServer) {
-            const st = await nativeServerStatus();
-            if (st?.running) {
-              selfEl.innerHTML = `<div class="pair-card">
-                <div class="pair-info">
-                  <div class="pair-label">本机配对码（手机）</div>
-                  <div class="pair-code">${escapeHtml(st.code || phonePairCode())}</div>
-                  <div class="pair-addr">端口 ${st.port} · 后台服务运行中，锁屏也能被访问</div>
-                </div>
-              </div>`;
-              return;
-            }
-          }
           selfEl.innerHTML = '';
           return;
         }
@@ -2218,7 +2288,11 @@ function openSyncPanel() {
           selfEl.innerHTML = '';
           return;
         }
-        const ip = info.addresses?.[0]?.address || '127.0.0.1';
+        // 多网卡时选与当前页面同网段的地址，别把 Hyper-V / WSL 的地址给对方
+        const ip =
+          pickPeerHost({ host: '', addresses: (info.addresses || []).map((a) => a?.address) }) ||
+          info.addresses?.[0]?.address ||
+          '127.0.0.1';
         const addr = info.httpsPort ? `https://${ip}:${info.httpsPort}` : `http://${ip}:${info.httpPort}`;
         selfEl.innerHTML = `
           <div class="pair-card">
@@ -2316,15 +2390,16 @@ function openManualPairDialog() {
   openModal({
     title: '手动添加设备',
     body: `<label class="field"><span class="field-label">设备地址</span>
-        <input id="manual-url" type="text" placeholder="https://192.168.1.10:8443" spellcheck="false">
+        <input id="manual-url" type="text" placeholder="192.168.1.10 或 https://192.168.1.10:8443" spellcheck="false">
       </label>
-      <p class="hint">在对方设备的同步面板顶部可以看到地址与配对码。</p>`,
+      <p class="hint">只填 IP 也可以，会自动补成 <code>http://IP:8787</code>。在对方设备的同步面板顶部可以看到地址与配对码。</p>`,
     footer: `<button class="btn ghost" data-cancel>取消</button><button class="btn primary" data-ok>下一步</button>`,
     onMount(root, close) {
       root.querySelector('[data-cancel]').onclick = close;
       root.querySelector('[data-ok]').onclick = () => {
-        const url = root.querySelector('#manual-url').value.trim();
-        if (!url) return;
+        const raw = root.querySelector('#manual-url').value.trim();
+        if (!raw) return;
+        const url = completeAddress(raw);
         close();
         openPairDialog({ name: hostOf(url) || '设备', url });
       };
@@ -2369,7 +2444,7 @@ function openPairDialog({ name, url, httpUrl, code: presetCode = '' }) {
           await pairWithDevice({ name, url, httpUrl, code, password });
           close();
         } catch (err) {
-          fail(err.message || '连接失败');
+          fail(syncErrorText(err));
         } finally {
           okBtn.disabled = false;
           okBtn.textContent = '连接';
@@ -2695,9 +2770,9 @@ async function runSync() {
     toast('已同步到该设备', 'ok');
   } catch (err) {
     if (err instanceof SyncError) {
-      toast(err.code === 'UNAUTHORIZED' ? '配对码已失效，请重新配对' : err.message, 'err', 4000);
+      toast(err.code === 'UNAUTHORIZED' ? '配对码已失效，请重新配对' : syncErrorText(err), 'err', 6000);
     } else {
-      toast(err.message || '同步失败', 'err', 4000);
+      toast(syncErrorText(err), 'err', 6000);
     }
   } finally {
     btn.disabled = false;

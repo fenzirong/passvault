@@ -99,16 +99,18 @@ jobs:
           KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
         run: |
           chmod +x android/gradlew
+          VERSION="$(node -p "require('./package.json').version")"
+          echo "构建版本：$VERSION"
           mkdir -p dist-apk
           cd android
           if [ -f release.keystore ]; then
             export KEYSTORE_FILE="$PWD/release.keystore"
             ./gradlew assembleRelease --no-daemon --stacktrace
-            cp app/build/outputs/apk/release/app-release.apk ../dist-apk/PassVault-1.5.1-release.apk
+            cp app/build/outputs/apk/release/app-release.apk "../dist-apk/PassVault-${VERSION}-release.apk"
             echo "✅ 已生成签名 release APK"
           else
             ./gradlew assembleDebug --no-daemon --stacktrace
-            cp app/build/outputs/apk/debug/app-debug.apk ../dist-apk/PassVault-1.5.1-debug.apk
+            cp app/build/outputs/apk/debug/app-debug.apk "../dist-apk/PassVault-${VERSION}-debug.apk"
             echo "⚠️ 未找到签名密钥，退回 debug APK"
           fi
       - uses: actions/upload-artifact@v4

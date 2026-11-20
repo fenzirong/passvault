@@ -27,9 +27,9 @@ public class VaultHttpServer {
     }
 
     private final VaultStore store;
-    private final String pairingCode;
+    private volatile String pairingCode;
     private final String deviceId;
-    private final String deviceName;
+    private volatile String deviceName;
     private final Listener listener;
 
     private ServerSocket serverSocket;
@@ -56,15 +56,44 @@ public class VaultHttpServer {
         return port;
     }
 
+    /** 页面里重新生成配对码后同步到运行中的服务，不再需要重启 */
+    public void updateAuth(String code) {
+        if (code != null && !code.isEmpty()) this.pairingCode = code;
+    }
+
+    public void setDeviceName(String name) {
+        if (name != null && !name.isEmpty()) this.deviceName = name;
+    }
+
+    /**
+     * 端口从 8787 开始顺延，避免上个实例没退干净（或别的 App 占用）时
+     * 整个后台服务直接失效 —— 那会让手机彻底无法被发现。
+     */
     public void start() throws IOException {
-        serverSocket = new ServerSocket();
-        serverSocket.setReuseAddress(true);
-        serverSocket.bind(new InetSocketAddress(8787));
-        port = serverSocket.getLocalPort();
-        running = true;
-        acceptThread = new Thread(this::acceptLoop, "passvault-http");
-        acceptThread.setDaemon(true);
-        acceptThread.start();
+        int[] candidates = { 8787, 8788, 8789, 8790, 0 };
+        IOException last = null;
+        for (int candidate : candidates) {
+            ServerSocket socket = new ServerSocket();
+            try {
+                socket.setReuseAddress(true);
+                socket.bind(new InetSocketAddress(candidate));
+                serverSocket = socket;
+                port = socket.getLocalPort();
+                running = true;
+                acceptThread = new Thread(this::acceptLoop, "passvault-http");
+                acceptThread.setDaemon(true);
+                acceptThread.start();
+                return;
+            } catch (IOException e) {
+                last = e;
+                try {
+                    socket.close();
+                } catch (IOException ignored) {
+                    // 忽略
+                }
+            }
+        }
+        throw last != null ? last : new IOException("没有可用端口");
     }
 
     public void stop() {
@@ -149,6 +178,7 @@ public class VaultHttpServer {
                 self.put("httpPort", port);
                 self.put("httpsPort", 0);
                 self.put("platform", "android");
+                self.put("addresses", new org.json.JSONArray(LanInterfaces.addresses()));
                 JSONObject res = new JSONObject();
                 res.put("self", self);
                 res.put("peers", new org.json.JSONArray());

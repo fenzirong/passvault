@@ -110,6 +110,9 @@ public class PassVaultServerPlugin extends Plugin {
         ret.put("port", PassVaultService.port);
         ret.put("revision", PassVaultService.store != null ? PassVaultService.store.getRevision() : 0);
         ret.put("code", PassVaultService.pairingCode);
+        // 手机自己的局域网地址：UDP 被防火墙挡住时，用户可以照着它手动填电脑端
+        ret.put("addresses", new JSONArray(LanInterfaces.addresses()));
+        ret.put("discoveryActive", PassVaultService.discovery != null && PassVaultService.discovery.isRunning());
         call.resolve(ret);
     }
 
